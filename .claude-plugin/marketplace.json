@@ -1,0 +1,14 @@
+{
+  "name": "tidbit",
+  "description": "tidbit for Claude Code.",
+  "owner": {
+    "name": "tidbit"
+  },
+  "plugins": [
+    {
+      "name": "tidbit",
+      "source": "./tidbit",
+      "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, and what's waiting for you."
+    }
+  ]
+}

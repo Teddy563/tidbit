@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "tidbit": {
+      "type": "http",
+      "url": "https://tidbit.video/mcp"
+    }
+  }
+}
