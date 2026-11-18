@@ -1,9 +1,10 @@
 {
   "name": "tidbit",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, and what's waiting for you.",
   "author": {
     "name": "tidbit"
   },
-  "homepage": "https://tidbit.video"
+  "homepage": "https://tidbit.video",
+  "icon": "./logo.png"
 }

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """tidbit worker: runs on your own computer, makes your project folders and renders clips with ffmpeg, keeps big files local.
-It never runs Claude. Claude work happens in your own open Claude session.
+It runs Claude only in your own open Claude session, unless you switch on "start Claude by itself" (off by default, one project folder at a time, your own login).
 
+  python tidbit_worker.py setup [CODE] --server https://tidbit.video --folder ~/tidbit   (everything in one go)
   python tidbit_worker.py init --folder ~/tidbit                 (make the folder; pair does this too)
   python tidbit_worker.py pair KXRT-MBQA --server https://tidbit.video --folder ~/tidbit
   python tidbit_worker.py run --folder ~/tidbit
@@ -15,7 +16,9 @@ notes, thumbnails up to 150 KB) are ever sent, slowly, in the background, and on
 """
 import argparse
 import base64
+import contextlib
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -47,7 +50,7 @@ if os.name == "nt" and sys.executable.lower().endswith("pythonw.exe"):  # autost
             super().__init__(*a, **{"creationflags": 0x08000000, **k})
     subprocess.Popen = _Quiet
 
-CAPS = ["ping", "caption_clip", "make_project", "open_project", "pull_result", "prepare_clip", "render_video", "upload_render"]  # the helper never runs Claude: Claude work happens in the user's own session
+CAPS = ["ping", "caption_clip", "make_project", "open_project", "pull_result", "prepare_clip", "render_video", "upload_render"]  # Claude runs only in the user's own session, or by itself in one project folder when the user switched that on (autostart_claude)
 SYNC_MAX, SYNC_BYTES_HOUR, SYNC_GAP = 150 * 1024, 2 * 1024 * 1024, 2.0
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # The production job-signing key, pinned in this file. A worker paired with tidbit.video refuses any other key, so a
@@ -1121,24 +1124,109 @@ def ready(a):
         print(slug, project_path(folder, slug))
 
 
-def run_open_project(job, folder, cfg):
+# Opt-in: with autostart_claude on in config.json, a project opened from tidbit runs `claude -p` in its folder on the user's own login.
+AUTO_MIN, AUTO_DAILY, AUTO_POLL = 30, 10, 5
+AUTO_TOOLS = "Read,Write,Edit,Glob,Grep,mcp__tidbit,mcp__plugin_tidbit_tidbit"  # files in the project folder (acceptEdits) and the tidbit tools; no shell
+AUTO_TASK = ("Read BRIEF.md and CLAUDE.md in this folder, then do the work they describe. Stay in this folder. Use the tidbit tools for data and "
+             "save results the way CLAUDE.md says. If a step costs credits or needs the user's decision, stop and say what you need.")
+
+
+def auto_counts(folder):
+    try:
+        return json.loads((tdir(folder) / "auto_runs.json").read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def auto_gate(folder, cfg, d, now=time.time):
+    """None when Claude may start by itself for this project, else the plain reason it may not. Starts nothing."""
+    h = claude_health(cfg)
+    if not h["installed"] or h["logged_in"] is False:
+        return "Claude is signed out on this computer. Run claude auth login in a terminal, then open the project."
+    if not (d / "project.json").is_file():
+        return "This project did not come from your tidbit account, so Claude was not started."
+    cap = int(cfg.get("auto_daily") or AUTO_DAILY)
+    if auto_counts(folder).get(time.strftime("%Y-%m-%d", time.localtime(now())), 0) >= cap:
+        return f"Today's limit of {cap} automatic runs is used up."
+    return None
+
+
+def auto_run(folder, cfg, slug, d, c, jid, now=time.time):
+    """One headless Claude run in the project folder, one at a time. Returns (state, note): done, failed, cancelled or needs_you."""
+    box = tdir(folder)
+    lock = box / "auto.lock"
+    limit = int(cfg.get("auto_minutes") or AUTO_MIN) * 60
+    try:
+        if lock.exists() and now() - lock.stat().st_mtime > limit + 300:
+            lock.unlink()  # left behind by a worker that died
+        os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        return "needs_you", "Claude is already working on another project. Open this one when it is done."
+    try:
+        day = time.strftime("%Y-%m-%d", time.localtime(now()))
+        (box / "auto_runs.json").write_text(json.dumps({day: auto_counts(folder).get(day, 0) + 1}), encoding="utf-8")
+        c.call("progress", {"job_id": jid, "pct": 5, "log": "state: claude working"})
+        argv = [claude_path(cfg), "-p", "--permission-mode", "acceptEdits", "--allowedTools", AUTO_TOOLS]
+        (box / "runs").mkdir(exist_ok=True)
+        with open(box / "runs" / f"{slug}.log", "ab") as lg:  # stays on this computer
+            p = subprocess.Popen(argv, cwd=d, stdin=subprocess.PIPE, stdout=lg, stderr=subprocess.STDOUT)
+            p.stdin.write(AUTO_TASK.encode())
+            p.stdin.close()
+            t0 = last = now()
+            while p.poll() is None:
+                time.sleep(AUTO_POLL)
+                stop = None
+                if now() - t0 > limit:
+                    stop = ("needs_you", f"Claude was still working after {limit // 60} minutes and was stopped. Open the project to continue.")
+                elif now() - last >= 30:
+                    last = now()
+                    try:
+                        if not c.call("progress", {"job_id": jid, "pct": min(95, 5 + int(90 * (now() - t0) / limit)), "log": ""}).get("ok"):
+                            stop = ("cancelled", "Cancelled by you")
+                    except Exception:
+                        pass
+                if stop:
+                    p.terminate()
+                    try:
+                        p.wait(10)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                    return stop
+        return ("done", "") if p.returncode == 0 else ("failed", "Claude stopped with an error. The log is in .tidbit/runs on this computer.")
+    finally:
+        lock.unlink(missing_ok=True)
+
+
+def run_open_project(job, folder, cfg, c=None):
     """Open a terminal running the user's claude in one project folder. The job names a project; it never carries a command.
-    With the Claude desktop app installed no window opens: the project waits in ready.json and the next session says so."""
+    With the Claude desktop app installed no window opens: the project waits in ready.json and the next session says so.
+    With auto-start on (off unless the user chose it) Claude runs by itself first; if it cannot, the project waits as above and the job says "needs_you"."""
     slug = str(job["params"].get("slug") or "")
     d = project_path(folder, slug) if re.fullmatch(r"[a-z0-9-]{1,80}", slug) else None
     if not (d and d.is_dir()):
         raise RuntimeError("That project is not in the tidbit folder on this computer. Send it to Claude again from tidbit.")
-    if (cfg or {}).get("open_in") != "cli" and desktop_app():
+    extra = {}
+    if (cfg or {}).get("autostart_claude") and c is not None:
+        why = auto_gate(folder, cfg, d)
+        if why is None:
+            state, why = auto_run(folder, cfg, slug, d, c, job["id"])
+            if state == "done":
+                return {"slug": slug, "state": "done", "auto": True}
+            if state in ("failed", "cancelled"):
+                raise RuntimeError(why)
+        c.call("progress", {"job_id": job["id"], "pct": 5, "log": "state: needs you"})
+        extra = {"state": "needs_you", "why": why}
+    if (cfg or {}).get("open_in") != "cli" and (desktop_app() or extra):
         ready_set(folder, slug)
-        return {"ready": slug, "app": "desktop"}
-    c = claude_path(cfg)
-    if not c:
+        return {"ready": slug, "app": "desktop", **extra}
+    c_ = claude_path(cfg)
+    if not c_:
         raise RuntimeError("Claude Code was not found on this computer. Install it with: " + INSTALL)
-    argv = terminal_argv(platform.system(), d, c)
+    argv = terminal_argv(platform.system(), d, c_)
     if not argv:
         raise RuntimeError(f"tidbit could not find a terminal to open. Open one in projects/{slug} and run: claude")
     subprocess.Popen(argv, cwd=d, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return {"opened": slug}
+    return {"opened": slug, **extra}
 
 
 def do_job(c, job, cfg, folder, now=time.time):
@@ -1165,7 +1253,7 @@ def do_job(c, job, cfg, folder, now=time.time):
         elif job["kind"] == "make_project":
             out = run_make_project(job, folder, c)
         elif job["kind"] == "open_project":
-            out = run_open_project(job, folder, cfg)
+            out = run_open_project(job, folder, cfg, c)
         elif job["kind"] == "pull_result":
             out = run_pull_result(job, folder)
         elif job["kind"] == "prepare_clip":
@@ -1297,7 +1385,7 @@ def status(a):
     folder = Path(a.folder).expanduser().resolve()
     cfg = load(folder)
     box = tdir(folder) / "outbox"
-    print(f"computer: {cfg['name']}\nserver:   {cfg['server']}\nfolder:   {folder}\nsync here: {'on' if cfg.get('sync') else 'off'}\nwaiting to sync: {len(list(box.glob('*.json')))}\nclaude:   {claude_line(claude_health(cfg))}")
+    print(f"computer: {cfg['name']}\nserver:   {cfg['server']}\nfolder:   {folder}\nsync here: {'on' if cfg.get('sync') else 'off'}\nwaiting to sync: {len(list(box.glob('*.json')))}\nclaude:   {claude_line(claude_health(cfg))}\nstart Claude by itself on a sent project: {'on, up to ' + str(cfg.get('auto_daily') or AUTO_DAILY) + ' a day' if cfg.get('autostart_claude') else 'off'}")
     try:
         r = Client(cfg["server"], cfg["key"], cfg["name"]).call("heartbeat", {"name": cfg["name"], "os": platform.system(), "folder": str(folder), "caps": CAPS, "claude": heartbeat_claude(cfg)})
         print(f"tidbit:   reachable, {r['waiting']} job(s) waiting, sync {'on' if r['sync'] else 'off'} in tidbit")
@@ -1380,6 +1468,73 @@ def uninstall_autostart(a):
     if f and f.is_file():
         f.unlink()
     print("The worker no longer starts by itself.")
+
+
+# ---------- /tidbit:setup in one go: folder, Claude check, pair, start with the computer, worker ----------
+
+def setup(a):
+    """Prints `tidbit-setup: <step> <ok|skip|need|fix> <text>` lines for the skill to turn into the status card. Never prints a key.
+    Exit 0 when done, 2 when it needs the user (a code, a fix)."""
+    def say(step, state, text=""):
+        print(f"tidbit-setup: {step} {state} {text}".rstrip(), flush=True)
+
+    def quiet(fn, *args):  # the old commands talk in sentences; keep their words only when they fail
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                fn(*args)
+        except SystemExit as e:
+            return (e.code if isinstance(e.code, str) else buf.getvalue().strip() or "failed") if e.code else None
+        return None
+
+    def stop(step, state, text):
+        say(step, state, text)
+        sys.exit(2)
+
+    if sys.version_info < (3, 9):
+        stop("python", "need", f"Python 3.9 or newer is needed, this is {platform.python_version()}")
+    say("python", "ok", platform.python_version())
+    folder = init_folder(a.folder)
+    say("folder", "ok", str(folder))
+    cfg = load(folder, False)
+    h = claude_health(cfg)
+    say("claude", "ok" if h["ready"] else "fix", claude_line(h))  # tidbit works without it; only background Claude jobs need it
+    server = (a.server or (cfg or {}).get("server") or "").rstrip("/")
+    if a.code:
+        err = quiet(pair, argparse.Namespace(code=a.code, server=server, folder=str(folder), name=None, no_mcp_add=True, no_sync=False))
+        if err:
+            stop("pair", "need", scrub(err.replace("Pairing failed: ", ""), ""))
+        say("pair", "ok", "this computer is paired")
+    elif cfg and server == cfg["server"]:
+        say("pair", "skip", "already paired")
+    else:
+        stop("pair", "need", "a pairing code is needed: tidbit, Connections page, Get a code")
+    if a.auto_claude or a.auto_daily:  # the user's choice, kept in config.json; off unless asked for
+        cfg = load(folder)
+        if a.auto_claude:
+            cfg["autostart_claude"] = a.auto_claude == "on"
+        if a.auto_daily:
+            cfg["auto_daily"] = max(1, min(a.auto_daily, 100))
+        save(folder, cfg)
+    cfg = load(folder, False) or {}
+    say("auto", "ok" if cfg.get("autostart_claude") else "skip", (f"Claude starts by itself on a sent project, up to {cfg.get('auto_daily') or AUTO_DAILY} a day" if cfg.get("autostart_claude")
+                                                                else "Claude does not start by itself. Projects wait for you to open them"))
+    if a.no_autostart:
+        say("worker", "skip", f'not started with the computer. Run it with: python tidbit_worker.py run --folder "{folder}"')
+    else:
+        err = quiet(install_autostart, argparse.Namespace(folder=str(folder)))
+        if err:
+            stop("worker", "fix", err)
+        up = lambda: (alive_age(folder) if alive_age(folder) is not None else 1e9) < 60
+        for _ in range(12):  # the worker writes its heartbeat file in the first seconds
+            if up():
+                break
+            time.sleep(1)
+        say("worker", "ok" if up() else "fix", "running, and starts when you sign in" if up() else "started but has not reported yet. Run doctor in a minute")
+    say("ffmpeg", "ok" if shutil.which("ffmpeg") else "skip", "found" if shutil.which("ffmpeg") else "not found. Only clip and render jobs need it; ask before installing")
+    if platform.system() == "Linux" and not a.no_autostart:
+        say("note", "ok", "to start before you sign in, run: loginctl enable-linger $USER")
+    say("done", "ok", "")
 
 
 # ---------- /tidbit fix: say what is wrong and how to fix it, change nothing ----------
@@ -1494,6 +1649,13 @@ def main(argv=None):
         s = sub.add_parser(n)
         s.add_argument("--folder", default="~/tidbit")
         s.add_argument("--once", action="store_true")
+    st = sub.add_parser("setup")
+    st.add_argument("code", nargs="?")
+    st.add_argument("--server")
+    st.add_argument("--folder", default="~/tidbit")
+    st.add_argument("--no-autostart", action="store_true", help="pair, but do not start the worker with the computer")
+    st.add_argument("--auto-claude", choices=("on", "off"), help="start Claude by itself in a project folder when you send a project (off unless you turn it on)")
+    st.add_argument("--auto-daily", type=int, help="most automatic Claude runs a day (default 10)")
     sh = sub.add_parser("shots")
     sh.add_argument("file", help="a video under inbox/, library/ or projects/<slug>/clips|renders/")
     sh.add_argument("--folder", default="~/tidbit")
@@ -1535,6 +1697,8 @@ def main(argv=None):
                 {"shots": run_shots, "cut": run_cut}[a.cmd](a)
             except RuntimeError as e:
                 sys.exit(f"tidbit: {e}")
+        elif a.cmd == "setup":
+            setup(a)
         elif a.cmd == "ready":
             ready(a)
         elif a.cmd == "install-autostart":

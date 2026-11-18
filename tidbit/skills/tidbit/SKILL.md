@@ -9,6 +9,8 @@ tidbit is the manager. This computer does the user's own work with the user's ow
 
 **Paths.** `W` is `scripts/tidbit_worker.py` two folders up from this skill's base directory (the plugin root). The tidbit folder is always written `"~/tidbit"`, in quotes: the worker expands it on every system, and backslashes may be eaten by the shell here. `PY` is `py -3` on Windows (fall back to `python`), `python3` on macOS and Linux. Run every worker command as `PY W <command> --folder "~/tidbit"`; `init` keeps a copy of the worker in the folder for autostart.
 
+**Language.** Answer in the language the user writes in; English by default. Keep commands, file names and button labels from tidbit or Meta as they are. Worker output is English; translate it.
+
 **Never:**
 - print, log or repeat a key, open `~/tidbit/.tidbit/config.json` or `~/tidbit/.tidbit/key`, or read env files;
 - edit the user's Claude settings, run sudo, or install anything without asking first.
@@ -17,20 +19,21 @@ tidbit is the manager. This computer does the user's own work with the user's ow
 
 ## setup
 
-Get this computer working in about five minutes with as few questions as possible. Do the checks yourself; ask only where the list below says ask. Never run two asking steps at once.
+Get this computer working in about five minutes. One worker command does the steps; you ask at most two questions.
 
-**The card is the progress.** `my_status` draws one checklist card (tidbit tools signed in, this computer paired, background worker running, Claude ready, video tools). Call it first, and again after every step below, so the user watches rows tick off. Between calls write at most one short sentence. Do not repeat the card's rows in text. Where a client shows no card, read `card.rows` from the result and say only what changed.
+**The card is the progress.** `my_status` draws one checklist card (tidbit tools signed in, this computer paired, background worker running, Claude ready, video tools). Call it first and after the setup command, so the user watches rows tick off. Between calls write one short sentence at most. Where a client shows no card, read `card.rows` and say only what changed.
 
-A code (8 letters, like KXRT-MBQA) may come with the command, or the user may paste one at any point. It is the pairing code and goes straight to step 3. A 4-character code (like GC7X) is different: it is a connection-check code, see `check CODE`. "tidbit tools signed in" on the card means the tools work, not that this computer is paired.
+A code (8 letters, like KXRT-MBQA) may come with the command, or the user may paste one at any point. It is the pairing code. A 4-character code (like GC7X) is a connection-check code, see `check CODE`. "tidbit tools signed in" on the card means the tools work, not that this computer is paired.
 
-**Start with what is already true.** Run `PY W doctor --folder "~/tidbit"` once and call `my_status`. Skip every step whose row is already done. If the tidbit tools are missing, say in one sentence that they sign in once by typing `/mcp`, choosing tidbit, and signing in in the browser. Do not wait for that.
-
-1. **Tools.** Needs Python 3.9 or newer. If Python is missing, ask, then send them to python.org and stop. Claude counts as ready when the Claude desktop app is installed (doctor says "desktop app"). Only if the user works in a terminal and doctor says Claude Code is signed out, tell them to run `claude auth login` in a separate terminal and run doctor again. No question when both are fine.
-2. **Folder.** This is where tidbit puts your projects and where your own Claude works. Do not ask; use `~/tidbit`. Run `PY W init --folder "~/tidbit"`.
-3. **Pair.** This links the computer to the user's tidbit account. If no code came with the command, ask for one thing only: "Open tidbit's Connections page, press Get a code, and paste the 8 letters here." Then run `PY W pair CODE --server https://beta3.tidbit.video --folder "~/tidbit" --no-mcp-add`. The plugin already added the tidbit tools, so `--no-mcp-add` is right. If the code is wrong or has run out, say so and ask for a new one. Never show or type the key.
-4. **Keep it running.** This lets tidbit reach the computer when you are not in a chat. One yes or no: "Start the tidbit worker whenever you sign in to this computer?" On yes run `PY W install-autostart --folder "~/tidbit"` (it also starts it now). On Linux, add the one line for them to run themselves so it starts before they sign in: `loginctl enable-linger $USER`. Do not run it. On no, run `PY W run --folder "~/tidbit"` in the background for this session and say it stops when the computer does.
-5. **Video tools.** Only if the card shows video tools missing: ask once whether they want tidbit to cut and render clips here. On yes. Ask before installing it (`winget install Gyan.FFmpeg`, `brew install ffmpeg` or `sudo apt install ffmpeg`). On no, skip it.
-6. **Check.** Run `PY W doctor --folder "~/tidbit"` again, fix any `FIX` line as in `fix`, and call `my_status` one last time. The worker reports every 15 seconds, so if a row still shows the old state, wait a few seconds and call it once more.
+1. **Look first.** Call `my_status`. If the tidbit tools are missing, say in one sentence that they sign in once by typing `/mcp`, choosing tidbit, and signing in in the browser. Do not wait for that.
+2. **Ask only what is missing.** No code and not paired yet: "Open tidbit's Connections page, press Get a code, and paste the 8 letters here." Never ask for or type a key. Then one yes or no: "Start the tidbit worker whenever you sign in to this computer?" (it lets tidbit reach the computer when no chat is open). Then a second yes or no, default no: "Start Claude by itself when you send a project from tidbit?" Say what it means in one sentence: it uses their Claude plan, works only inside that project's folder, runs one at a time, up to 10 a day, and stops if Claude is signed out. Ask the two together, and never turn it on without a clear yes. Python 3.9 or newer is needed: if `PY` is missing, ask, then send them to python.org and stop.
+3. **Run it.** `PY W setup [CODE] --server https://beta3.tidbit.video --folder "~/tidbit"`, plus `--no-autostart` when they said no to the first, and `--auto-claude on` (or `off`) for the second, with `--auto-daily N` if they want another daily limit. Without the flag the choice stays as it was, off at first. It makes the folder, checks Claude, pairs, starts the worker and prints lines `tidbit-setup: STEP STATE text`. STEP is python, folder, claude, pair, auto, worker, ffmpeg, note or done; STATE is ok, skip, need or fix. It never prints a key. Say what happened from these lines in the user's language, not the lines themselves.
+   - `need` (exit 2) means it stopped for the user: a wrong or expired code ("ask for a new one"), no code, or an old Python. Get what it asks for and run it again; finished steps are skipped.
+   - `fix` on claude: the desktop app counts as ready. Only if they work in a terminal, tell them to run `claude auth login` in a separate terminal. On worker: run `doctor` and follow `fix`.
+   - `skip` on ffmpeg: ask once whether they want tidbit to cut and render clips here. On yes. Ask before installing it (`winget install Gyan.FFmpeg`, `brew install ffmpeg` or `sudo apt install ffmpeg`). On no, leave it.
+   - With `--no-autostart`, run `PY W run --folder "~/tidbit"` in the background and say it stops when the computer does.
+   - A `note` line on Linux gives one command for the user to run themselves. Do not run it.
+4. **Check.** Call `my_status` once more. The worker reports every 15 seconds, so if a row still shows the old state, wait a few seconds and call it once more.
 
 **End with two plain lines and nothing else (the card already shows the state):**
 - What works now (for example: tidbit tools in this chat, projects in the folder, clip jobs in the background).
@@ -38,7 +41,7 @@ A code (8 letters, like KXRT-MBQA) may come with the command, or the user may pa
 
 Then these notes, one line each:
 - For work in a Claude session, that session has to stay open. For background clip and render jobs, the computer and the worker stay on; while the computer is off, jobs wait.
-- The worker never runs Claude. Writing, plans and replies wait on tidbit until you open Claude and say go.
+- Unless you chose to start Claude by itself, the worker never runs Claude. Writing, plans and replies wait on tidbit until you open Claude and say go.
 - tidbit does not learn from your results unless you switch that on in Settings on tidbit. It is off.
 - You can let Claude spend a few tidbit credits without asking: /tidbit:budget. It covers tidbit credits only.
 
@@ -48,7 +51,7 @@ A 4-character code (like GC7X) from the "Check that Claude reaches tidbit" butto
 
 ## pair CODE [ADDRESS]
 
-Step 3 of setup only. Default address `https://beta3.tidbit.video` (this is the beta build).
+The pairing step of `setup`, by itself: `PY W setup CODE --server ADDRESS --folder "~/tidbit" --no-autostart`. Default address `https://beta3.tidbit.video` (this is the beta build).
 
 ## status
 
@@ -66,8 +69,8 @@ Call `my_status`; the card is the answer. Add one line only for a row that needs
 - settings rule warning: explain what the rule is and that tidbit jobs ignore personal settings. Never edit the file; the user decides;
 - tidbit not in Claude Code: ask the user to run `/plugin install tidbit` (or `PY W mcp-add --folder "~/tidbit"` if they installed no plugin), then restart Claude Code;
 - tidbit needs sign-in: tell the user to type `/mcp`, choose tidbit, and sign in;
-- key not found: they need a new code, as in setup step 3;
-- ffmpeg missing: as in setup step 5.
+- key not found: they need a new code, then `setup` again;
+- ffmpeg missing: as the ffmpeg line in `setup`.
 Run doctor again and report what changed.
 
 ## project
@@ -81,6 +84,10 @@ When a session starts in a project folder, the start-up line shows the brief. Do
 4. Quote the price and wait for a yes before anything that costs credits.
 
 In claude.ai there is no folder to open. The tidbit prompt `start_project` loads the same brief.
+
+## auto-start
+
+Off unless the user chose it in `setup`. When a project is sent from tidbit and auto-start is on, the worker runs Claude in that project folder on the user's own login, with a 30 minute limit. If Claude is signed out, the daily limit is used up, or another run is going, the project waits and tidbit shows "Needs you". Change it with `PY W setup --auto-claude on|off --server ADDRESS --folder "~/tidbit"`. The run's log stays in `~/tidbit/.tidbit/runs/`. Stopping the job on tidbit stops the run.
 
 ## work
 
@@ -102,7 +109,7 @@ Clip and render jobs (`start_job` with `prepare_clip` or `render_video`) run in 
 
 ## shots
 
-Find the best moments in one video the user already has in the tidbit folder. Runs on this computer with ffmpeg; nothing is uploaded. Needs ffmpeg (setup step 5).
+Find the best moments in one video the user already has in the tidbit folder. Runs on this computer with ffmpeg; nothing is uploaded. Needs ffmpeg (the ffmpeg line in `setup`).
 
 1. The user names a file under `~/tidbit/inbox/`, `~/tidbit/library/` or `~/tidbit/projects/<name>/clips|renders/`. If they do not, list `inbox/` and ask.
 2. Run `PY W shots REL --folder "~/tidbit"`, with `REL` relative to the tidbit folder (for example `inbox/gym-raw.mp4`). It prints the paths of a JSON file and a contact sheet, and one line of pacing. Add `--threshold 0.2` if it finds too few cuts, `--max 8` for shorter shots.
@@ -132,7 +139,7 @@ Compare the order of the user's footage with what works, then suggest a new orde
 
 ## testing against the beta
 
-The plugin points at `https://tidbit.video/mcp`. To test against the beta, add a second server by hand and pair with the beta address in step 3:
+The plugin points at `https://tidbit.video/mcp`. To test against the beta, add a second server by hand and pair with the beta address in `setup`:
 
 ```
 claude mcp add --transport http tidbit-beta3 https://beta3.tidbit.video/mcp
