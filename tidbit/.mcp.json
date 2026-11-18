@@ -2,7 +2,7 @@
   "mcpServers": {
     "tidbit": {
       "type": "http",
-      "url": "https://tidbit.video/mcp"
+      "url": "https://beta3.tidbit.video/mcp"
     }
   }
 }
