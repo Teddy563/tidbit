@@ -1,6 +1,6 @@
 ---
 name: tidbit
-description: Set up, check and fix tidbit on this computer, work on tidbit projects in the tidbit folder, and answer the user's own waiting tidbit Claude jobs in this session. Use for /tidbit setup, pair, status, work, shots, clips, structure, library, organize, find-clips, login and fix, for finding the best shots in or cutting clips from the user's own footage, for sorting the tidbit folder and tagging reusable clips, for searching the user's library when planning or editing a video, when the user gives a tidbit pairing code like KXRT-MBQA or a connection-check code like GC7X, when a session starts in a tidbit project folder, or when tidbit jobs fail, wait, or say "Sign in needed".
+description: Set up, check and fix tidbit on this computer, work on tidbit projects in the tidbit folder, and answer the user's own waiting tidbit Claude jobs in this session. Use for /tidbit:setup, pair, status, work, shots, clips, structure, library, organize, find-clips, login and fix, for finding the best shots in or cutting clips from the user's own footage, for sorting the tidbit folder and tagging reusable clips, for searching the user's library when planning or editing a video, when the user gives a tidbit pairing code like KXRT-MBQA or a connection-check code like GC7X, when a session starts in a tidbit project folder, or when tidbit jobs fail, wait, or say "Sign in needed".
 ---
 
 # tidbit on this computer

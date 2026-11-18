@@ -1762,7 +1762,7 @@ def hook(a):
     try:
         folder = Path(a.folder).expanduser().resolve()
         if not (folder / ".tidbit/config.json").is_file():
-            print("tidbit: not connected on this computer. Run /tidbit setup to connect it.")
+            print("tidbit: not connected on this computer. Run /tidbit:setup to connect it.")
             return
         al = json.loads((folder / ".tidbit/alive.json").read_text(encoding="utf-8"))
         cl = al.get("claude") or {}
