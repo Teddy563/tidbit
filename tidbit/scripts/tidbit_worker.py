@@ -9,10 +9,12 @@ It runs Claude only in your own open Claude session, unless you switch on "start
   python tidbit_worker.py status --folder ~/tidbit
   python tidbit_worker.py login | mcp-add | doctor | install-autostart | uninstall-autostart --folder ~/tidbit
   python tidbit_worker.py outbox KIND REF file.json --folder ~/tidbit    (queue a small result to sync)
+  python tidbit_worker.py upload --all | clips/hooks | --on | --off --folder ~/tidbit   (library files to tidbit; needs the switch on)
 
 Python 3.9+, standard library only (ffmpeg only for clip and render jobs). Windows, macOS, Linux.
 Videos, frames and project files stay in the folder (inbox, raw, clips, projects, renders, photos, audio, jobs). Only small results (cards, tags, design
 notes, thumbnails up to 150 KB) are ever sent, slowly, in the background, and only while sync is on in tidbit and here.
+Your library files upload only after you switch on "Upload my library to tidbit" for this computer (off by default).
 """
 import argparse
 import base64
@@ -1171,6 +1173,58 @@ def scan_assets(root):
                 yield rel, p, kind
 
 
+INDEX_DEFAULT_SCORE = 50  # a clip a folder's index.json describes is one somebody kept to reuse
+
+
+def index_entries(d):
+    """The entries of d/index.json by lower-case file name and by name without the extension. Reads a list, {"clips": [...]} or {name: entry}."""
+    try:
+        raw = json.loads((d / "index.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    if isinstance(raw, dict):
+        raw = next((v for v in raw.values() if isinstance(v, list)), None) or [{**v, "name": k} for k, v in raw.items() if isinstance(v, dict)]
+    out = {}
+    for e in raw if isinstance(raw, list) else []:
+        name = next((str(e[k]) for k in ("file", "filename", "clip", "path", "name", "id") if isinstance(e, dict) and e.get(k)), "")
+        n = Path(name.replace("\\", "/")).name.lower()
+        if n:
+            out[n] = out[Path(n).stem] = e
+    return out
+
+
+def index_meta(e):
+    """(tags, use, score) a folder index says about one clip. Tags are its tags plus location, angle and movement, each made to fit the tag shape."""
+    t = e.get("tags")
+    raw = [x for x in (t.split(",") if isinstance(t, str) else t if isinstance(t, list) else []) if isinstance(x, str)]
+    raw += [e[k] for k in ("location", "angle", "movement") if isinstance(e.get(k), str)]
+    tags = list(dict.fromkeys(x for x in (re.sub(r"[^a-z0-9]+", " ", r.lower()).strip()[:24].strip() for r in raw) if TAG_RE.fullmatch(x)))[:8]
+    use = next((" ".join(e[k].split())[:140] for k in ("description", "desc", "summary", "use", "note", "caption") if isinstance(e.get(k), str) and e[k].strip()), "")
+    score = next((int(e[k]) for k in ("score", "rating", "quality") if isinstance(e.get(k), (int, float)) and not isinstance(e.get(k), bool) and 0 <= e[k] <= 100), INDEX_DEFAULT_SCORE)
+    return tags, use, score
+
+
+def apply_index(root, assets, meta):
+    """Fill tags, use note and score from the index.json beside a clip, only where the clip has none yet. Saves library.json when something changed."""
+    cache, changed = {}, False
+    for rel, p, kind in assets:
+        if p.parent not in cache:
+            cache[p.parent] = index_entries(p.parent)
+        e = cache[p.parent].get(p.name.lower()) or cache[p.parent].get(p.stem.lower())
+        if not isinstance(e, dict):
+            continue
+        tags, use, score = index_meta(e)
+        cur = meta.setdefault(rel, {})
+        for k, v in (("tags", tags), ("use", use), ("score", score)):
+            if v and k not in cur:
+                cur[k], changed = v, True
+        if not cur:
+            del meta[rel]
+    if changed:
+        lib_save(root, "library.json", meta)
+    return meta
+
+
 def thumb_of(path, secs=0.0):
     """A 96 px wide JPEG as a data link, or None (no ffmpeg, or a file it cannot read)."""
     for ss in ([["-ss", f"{min(1.0, secs / 2):.2f}"]] if secs else []) + [[]]:
@@ -1188,8 +1242,9 @@ def catalog_queue(folder, everything=False):
     """Queue what changed since the last time as rows for tidbit's Library (kind asset). Best clips first, nothing past 25 GB.
     Returns (files, queued, gone, over, bytes)."""
     root = Path(folder).expanduser().resolve()
-    meta, state, rows = lib_file(root, "library.json"), lib_file(root, "library-state.json"), []
-    for rel, p, kind in scan_assets(root):
+    assets = list(scan_assets(root))
+    meta, state, rows = apply_index(root, assets, lib_file(root, "library.json")), lib_file(root, "library-state.json"), []
+    for rel, p, kind in assets:
         try:
             s = p.stat()
         except OSError:
@@ -1233,15 +1288,167 @@ def run_catalog(a):
         print("Syncing is off on this computer, so tidbit's Library stays empty. Turn it on in Connections on tidbit.")
 
 
-def library_loop(folder, st):
-    """Every ten minutes, while syncing is on: look for new, changed and removed files. A first look at a big folder can take a while."""
-    while not st.stop:
+# ---------- uploads: the files themselves, only while "Upload my library to tidbit" is on for this computer ----------
+
+UP_MAX = 500 * 2**20  # per file
+UP_GB_HOUR = 2.0
+LIB_EVERY_MIN = 60
+
+
+def file_sha(p):
+    h = hashlib.sha256()
+    with p.open("rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def flush_outbox(c, folder, wait=300):
+    """Send the queued rows now (the background sender does the same, slowly), so the files can be matched to their rows. Returns a reason when it stops early."""
+    box, end = tdir(folder) / "outbox", time.time() + wait
+    for f in sorted(box.glob("*.json")):
+        while True:
+            try:
+                c.call("sync", json.loads(f.read_bytes()))
+                f.unlink(missing_ok=True)
+                break
+            except (OSError, ValueError):
+                break
+            except Fail as e:
+                if e.code in (400, 413):
+                    (box / "rejected").mkdir(exist_ok=True)
+                    f.replace(box / "rejected" / f.name)
+                    break
+                if e.code == 429 and time.time() < end:
+                    time.sleep(20)
+                    continue
+                return str(e)
+        time.sleep(2.1)
+    return None
+
+
+def put_file(url, f, size, mime):
+    if not str(url).startswith("https://"):
+        raise RuntimeError("tidbit sent an upload link this computer will not use.")
+    for n in range(3):
         try:
-            if st.sync_server and load(folder).get("sync"):
+            with f.open("rb") as h:
+                urllib.request.urlopen(urllib.request.Request(url, data=h, method="PUT", headers={"Content-Type": mime, "Content-Length": str(size)}), timeout=600).close()
+            return
+        except (urllib.error.URLError, OSError) as e:
+            if n == 2:
+                raise RuntimeError(f"The upload did not go through ({getattr(e, 'code', 'no connection')}).") from None
+            time.sleep(5 * (n + 1))
+
+
+def upload_pass(c, folder, prefix=None, max_bytes=None):
+    """Upload library files to tidbit: clips first, best score first, skipping what is already there. Stops at the hourly budget, the 25 GB limit or an
+    off switch. Only files the library lists, inside the tidbit folder. Returns a dict of counts and a `stop` sentence or None."""
+    root = Path(folder).expanduser().resolve()
+    meta, state = lib_file(root, "library.json"), lib_file(root, "upload-state.json")
+    todo = []
+    for rel, p, kind in scan_assets(root):
+        if prefix and rel != prefix and not rel.startswith(prefix.rstrip("/") + "/"):
+            continue
+        try:
+            s = p.stat()
+        except OSError:
+            continue
+        todo.append((0 if "clips" in rel.split("/")[:-1] else 1, -(meta.get(rel) or {}).get("score", 0), -int(s.st_mtime), rel, p, s))
+    todo.sort(key=lambda x: x[:4])
+    out = {"sent": 0, "skipped": 0, "waiting": 0, "too_big": 0, "bytes": 0, "stop": None}
+    for *_, rel, p, s in todo:
+        if s.st_size > UP_MAX:
+            out["too_big"] += 1
+            continue
+        if max_bytes is not None and out["bytes"] + s.st_size > max_bytes:
+            out["stop"] = "That is all for this hour. The rest follows in the next hour."
+            break
+        sig = f"{s.st_size}:{int(s.st_mtime)}"
+        if (state.get(rel) or {}).get("sig") != sig:
+            state[rel] = {"sig": sig, "sha": file_sha(p)}
+        body = {"path": rel, "size": s.st_size, "sha256": state[rel]["sha"]}
+        try:
+            r = c.call("upload", body)
+            if r.get("skip"):
+                out["skipped"] += 1
+                continue
+            put_file(r["put_url"], p, s.st_size, r.get("content_type") or "application/octet-stream")
+            c.call("uploaded", body)
+        except Fail as e:
+            if e.code in (403, 413, 503):  # off, full, or storage down: no point going on
+                out["stop"] = str(e)
+                break
+            out["waiting"] += 1  # not in the list yet, or changed since: next time
+            continue
+        except RuntimeError as e:
+            out["stop"] = str(e)
+            break
+        out["sent"] += 1
+        out["bytes"] += s.st_size
+    lib_save(root, "upload-state.json", state)
+    return out
+
+
+def upload_say(r):
+    n = lambda k, one, many: f"{k} {one if k == 1 else many}"  # noqa: E731
+    parts = [f"Uploaded {n(r['sent'], 'file', 'files')} ({r['bytes'] / 2**20:.0f} MB) to tidbit."]
+    if r["skipped"]:
+        parts.append(f"{r['skipped']} already there.")
+    if r["waiting"]:
+        parts.append(f"{n(r['waiting'], 'file is', 'files are')} not in your library list yet. Run this again in a few minutes.")
+    if r["too_big"]:
+        parts.append(f"{n(r['too_big'], 'file is', 'files are')} over 500 MB, so {'it stays' if r['too_big'] == 1 else 'they stay'} on this computer. Cut longer ones shorter.")
+    if r["stop"]:
+        parts.append(r["stop"])
+    return " ".join(parts)
+
+
+def run_upload(a):
+    """upload --on | --off | --all | PATH (a file or a folder). Needs "Upload my library to tidbit" on for this computer."""
+    cfg = load(a.folder)
+    c = Client(cfg["server"], cfg["key"], cfg["name"])
+    if a.on or a.off:
+        c.call("setting", {"upload": bool(a.on)})
+        print("Upload my library to tidbit is " + ("on" if a.on else "off") + " for this computer." + (" Files you uploaded stay on tidbit until you remove them from your folder." if a.off else ""))
+        if a.on and not cfg.get("sync"):
+            print("Sending small results to tidbit is off on this computer, so nothing uploads yet. Turn it on in Connections on tidbit.")
+        return
+    prefix = None
+    if a.path:
+        root = Path(a.folder).expanduser().resolve()
+        rel = a.path.replace("\\", "/").strip("/")
+        if ".." in rel.split("/") or re.match(r"[A-Za-z]:", rel) or not (root / rel).exists():
+            raise RuntimeError("Name a file or folder inside your tidbit folder, like clips/hooks.")
+        if not (root / rel).resolve().is_relative_to(root):
+            raise RuntimeError("That is outside your tidbit folder, so tidbit will not upload it.")
+        prefix = rel
+    elif not a.all:
+        raise RuntimeError("Say what to upload: a file or folder in your tidbit folder, or --all.")
+    catalog_queue(a.folder)
+    flush_outbox(c, a.folder)
+    try:
+        r = upload_pass(c, a.folder, prefix, int(a.max_mb * 2**20) if a.max_mb else None)
+    except Fail as e:
+        raise RuntimeError(str(e)) from None
+    print(upload_say(r))
+
+
+def library_loop(c, folder, st):
+    """Every hour (library_every_min in config.json), while syncing is on: look for new, changed and removed files, then upload up to upload_gb_hour (2)
+    if Upload my library to tidbit is on. Runs on its own thread, so jobs never wait for it."""
+    time.sleep(45)  # the first heartbeat tells us what tidbit allows
+    while not st.stop:
+        cfg = load(folder, False) or {}
+        try:
+            if st.sync_server and cfg.get("sync"):
                 catalog_queue(folder)
+                if st.upload_server:
+                    flush_outbox(c, folder)
+                    upload_pass(c, folder, None, int(float(cfg.get("upload_gb_hour") or UP_GB_HOUR) * 2**30))
         except Exception:
             pass
-        time.sleep(600)
+        time.sleep(max(5, float(cfg.get("library_every_min") or LIB_EVERY_MIN)) * 60)
 
 
 def terminal_argv(system, d, claude, which=shutil.which):
@@ -1466,6 +1673,7 @@ def outbox_put(folder, kind, ref, data):
 
 class State:
     sync_server = False  # tidbit's side of the consent, learned from the heartbeat
+    upload_server = False  # Upload my library to tidbit, same way
     waiting = 0
     stop = False
 
@@ -1476,7 +1684,7 @@ def heartbeat_loop(c, cfg, folder, st):
             hc = heartbeat_claude(cfg)
             (tdir(folder) / "alive.json").write_text(json.dumps({"t": time.time(), "claude": hc}))  # read by the plugin's status line
             r = c.call("heartbeat", {"name": c.name, "os": platform.system(), "folder": str(folder), "caps": CAPS, "claude": hc})
-            st.sync_server, st.waiting = bool(r.get("sync")), r.get("waiting", 0)
+            st.sync_server, st.upload_server, st.waiting = bool(r.get("sync")), bool(r.get("upload")), r.get("waiting", 0)
         except Exception:
             pass
         time.sleep(15)
@@ -1532,7 +1740,7 @@ def run(a):
     c, st = Client(cfg["server"], cfg["key"], cfg["name"]), State()
     threading.Thread(target=heartbeat_loop, args=(c, cfg, folder, st), daemon=True).start()
     threading.Thread(target=sync_loop, args=(c, cfg, folder, st), daemon=True).start()
-    threading.Thread(target=library_loop, args=(folder, st), daemon=True).start()
+    threading.Thread(target=library_loop, args=(c, folder, st), daemon=True).start()
     print(f"tidbit worker is running for {cfg['name']}. Leave this window open. Ctrl+C stops it.", flush=True)
     log(folder, "worker started")
     while True:
@@ -1695,6 +1903,13 @@ def setup(a):
     cfg = load(folder, False) or {}
     say("auto", "ok" if cfg.get("autostart_claude") else "skip", (f"Claude starts by itself on a sent project, up to {cfg.get('auto_daily') or AUTO_DAILY} a day" if cfg.get("autostart_claude")
                                                                 else "Claude does not start by itself. Projects wait for you to open them"))
+    if a.upload:  # the user's choice, kept on tidbit's side so the Library page shows the same switch
+        cfg = load(folder)
+        try:
+            Client(cfg["server"], cfg["key"], cfg["name"]).call("setting", {"upload": a.upload == "on"})
+            say("upload", "ok" if a.upload == "on" else "skip", "files in your library upload to tidbit, up to 2 GB an hour" if a.upload == "on" else "your files stay on this computer")
+        except Fail as e:
+            say("upload", "fix", str(e))
     if a.no_autostart:
         say("worker", "skip", f'not started with the computer. Run it with: python tidbit_worker.py run --folder "{folder}"')
     else:
@@ -1832,6 +2047,7 @@ def main(argv=None):
     st.add_argument("--no-autostart", action="store_true", help="pair, but do not start the worker with the computer")
     st.add_argument("--auto-claude", choices=("on", "off"), help="start Claude by itself in a project folder when you send a project (off unless you turn it on)")
     st.add_argument("--auto-daily", type=int, help="most automatic Claude runs a day (default 10)")
+    st.add_argument("--upload", choices=("on", "off"), help="upload my library to tidbit, so the clips can be played there (off unless you turn it on)")
     sh = sub.add_parser("shots")
     sh.add_argument("file", help="a video in the tidbit folder, like inbox/take.mp4 or clips/hooks/hook-01.mp4")
     sh.add_argument("--folder", default="~/tidbit")
@@ -1862,6 +2078,13 @@ def main(argv=None):
     ct = sub.add_parser("catalog")
     ct.add_argument("--all", action="store_true", help="send every row again")
     ct.add_argument("--folder", default="~/tidbit")
+    up = sub.add_parser("upload")
+    up.add_argument("path", nargs="?", help="a file or folder in your tidbit folder, like clips/hooks")
+    up.add_argument("--all", action="store_true", help="every library file, clips first, best score first")
+    up.add_argument("--max-mb", type=float, help="stop after this many megabytes")
+    up.add_argument("--on", action="store_true", help="switch Upload my library to tidbit on for this computer")
+    up.add_argument("--off", action="store_true", help="switch it off")
+    up.add_argument("--folder", default="~/tidbit")
     rd = sub.add_parser("ready")
     rd.add_argument("--done")
     rd.add_argument("--folder", default="~/tidbit")
@@ -1885,9 +2108,9 @@ def main(argv=None):
             mcp_add(cfg["server"], cfg["key"], cfg, a.folder)
         elif a.cmd in ("login", "doctor", "hook"):
             {"login": login, "doctor": doctor, "hook": hook}[a.cmd](a)
-        elif a.cmd in ("shots", "cut", "tag", "move", "catalog"):
+        elif a.cmd in ("shots", "cut", "tag", "move", "catalog", "upload"):
             try:
-                {"shots": run_shots, "cut": run_cut, "tag": run_tag, "move": run_move, "catalog": run_catalog}[a.cmd](a)
+                {"shots": run_shots, "cut": run_cut, "tag": run_tag, "move": run_move, "catalog": run_catalog, "upload": run_upload}[a.cmd](a)
             except RuntimeError as e:
                 sys.exit(f"tidbit: {e}")
         elif a.cmd == "setup":
