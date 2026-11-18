@@ -1,6 +1,6 @@
 ---
 name: tidbit
-description: Set up, check and fix tidbit on this computer, work on tidbit projects in the tidbit folder, and answer the user's own waiting tidbit Claude jobs in this session. Use for /tidbit setup, pair, status, work, shots, clips, structure, login and fix, for finding the best shots in or cutting clips from the user's own footage, when the user gives a tidbit pairing code like KXRT-MBQA, when a session starts in a tidbit project folder, or when tidbit jobs fail, wait, or say "Sign in needed".
+description: Set up, check and fix tidbit on this computer, work on tidbit projects in the tidbit folder, and answer the user's own waiting tidbit Claude jobs in this session. Use for /tidbit setup, pair, status, work, shots, clips, structure, login and fix, for finding the best shots in or cutting clips from the user's own footage, when the user gives a tidbit pairing code like KXRT-MBQA or a connection-check code like GC7X, when a session starts in a tidbit project folder, or when tidbit jobs fail, wait, or say "Sign in needed".
 ---
 
 # tidbit on this computer
@@ -21,7 +21,7 @@ Get this computer working in about five minutes with as few questions as possibl
 
 **The card is the progress.** `my_status` draws one checklist card (tidbit tools signed in, this computer paired, background worker running, Claude ready, video tools). Call it first, and again after every step below, so the user watches rows tick off. Between calls write at most one short sentence. Do not repeat the card's rows in text. Where a client shows no card, read `card.rows` from the result and say only what changed.
 
-A code (8 letters, like KXRT-MBQA) may come with the command, or the user may paste one at any point. It is the pairing code and goes straight to step 3. It is never a connection-check code. "tidbit tools signed in" on the card means the tools work, not that this computer is paired.
+A code (8 letters, like KXRT-MBQA) may come with the command, or the user may paste one at any point. It is the pairing code and goes straight to step 3. A 4-character code (like GC7X) is different: it is a connection-check code, see `check CODE`. "tidbit tools signed in" on the card means the tools work, not that this computer is paired.
 
 **Start with what is already true.** Run `PY W doctor --folder "~/tidbit"` once and call `my_status`. Skip every step whose row is already done. If the tidbit tools are missing, say in one sentence that they sign in once by typing `/mcp`, choosing tidbit, and signing in in the browser. Do not wait for that.
 
@@ -41,6 +41,10 @@ Then these notes, one line each:
 - The worker never runs Claude. Writing, plans and replies wait on tidbit until you open Claude and say go.
 - tidbit does not learn from your results unless you switch that on in Settings on tidbit. It is off.
 - You can let Claude spend a few tidbit credits without asking: /tidbit:budget. It covers tidbit credits only.
+
+## check CODE
+
+A 4-character code (like GC7X) from the "Check that Claude reaches tidbit" button on tidbit's Connections page. Call the tidbit tool `connection_check` with that code and say its answer as it is. If the tidbit tools are not available in this chat, say one line: type `/mcp`, choose tidbit and sign in, then try again. The code works once, for 5 minutes.
 
 ## pair CODE [ADDRESS]
 
