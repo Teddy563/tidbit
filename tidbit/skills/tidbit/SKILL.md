@@ -17,7 +17,7 @@ tidbit is the manager. This computer does the user's own work with the user's ow
 
 ## setup
 
-A guided walk-through. One step at a time. Say what each step is for in one plain sentence. Ask before anything that installs or changes the computer, and wait for a yes. Never run two asking steps at once.
+A guided walk-through. One step at a time. If the user typed a code with setup (8 letters, like KXRT-MBQA), it is the pairing code: never treat it as a connection-check code, and do every step below anyway, using it in step 5. "Already connected" in `my_status` means the tidbit tools work; it does not mean this computer is paired. Say what each step is for in one plain sentence. Ask before anything that installs or changes the computer, and wait for a yes. Never run two asking steps at once.
 
 **First, show something real.** If the tidbit tools are present, call `my_status`, then `get_research` or `my_saved_videos`, and show the user one thing from their own account: their last research or a video they saved, in one or two lines. If the tools are not there yet, say so in one sentence: the plugin added tidbit, but they have to sign in once. Tell them to type `/mcp`, choose tidbit, and sign in in the browser. Then go on with the local steps; do not wait.
 
