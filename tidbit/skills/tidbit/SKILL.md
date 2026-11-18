@@ -27,7 +27,7 @@ Then:
 2. **Claude Code.** You are in it, so it is installed. `PY W doctor --folder F` shows where the worker found it, even when it is not on PATH.
 3. **Signed in.** If doctor says Claude Code is signed out, tell the user to run `claude auth login` in a separate terminal (it opens a browser). The Claude desktop app's sign-in does not sign in Claude Code. Run doctor again until it says ready.
 4. **The tidbit folder.** Ask where; the default is `F`. Then `PY W init --folder F`. It makes `inbox`, `projects`, `jobs`, a README, and a hidden `.tidbit` for settings. Tell the user in one line what the folder is for.
-5. **Pair this computer.** Ask for the code from tidbit's Connections page (8 letters, good for 10 minutes; the page shows it after "Get a code"). Then run `PY F/tidbit_worker.py pair CODE --server https://tidbit.video --folder F --no-mcp-add`. The plugin already added the tidbit tools, so `--no-mcp-add` is right. If the user is testing on the beta, use the preview address the tidbit team gave them (a tailnet or local address) instead; this build pairs only with tidbit.video or a local or tailnet preview. If it prints a next step, do that step; never type or show the key.
+5. **Pair this computer.** Ask for the code from tidbit's Connections page (8 letters, good for 10 minutes; the page shows it after "Get a code"). Then run `PY F/tidbit_worker.py pair CODE --server https://beta3.tidbit.video --folder F --no-mcp-add`. The plugin already added the tidbit tools, so `--no-mcp-add` is right. If the user is testing on the beta, use `https://beta3.tidbit.video` instead (the worker knows the beta's own key). If it prints a next step, do that step; never type or show the key.
 6. **Start with the computer.** Ask, then `PY F/tidbit_worker.py install-autostart --folder F`. On Linux, also tell them the one line to run themselves so it starts before they sign in: `loginctl enable-linger $USER`. Do not run it.
 7. **Video tools (only if they want renders).** Ask if they want tidbit to make or render videos here. If yes, `ffmpeg -version`; if it is missing, ask, then `winget install Gyan.FFmpeg`, `brew install ffmpeg` or `sudo apt install ffmpeg`. If no, skip it.
 8. **What has to stay running.** Say this plainly:
@@ -46,7 +46,7 @@ Then add one line: "You can let Claude spend a few tidbit credits without asking
 
 ## pair CODE [ADDRESS]
 
-Step 5 of setup only. Default address `https://tidbit.video`.
+Step 5 of setup only. Default address `https://beta3.tidbit.video` (this is the beta build).
 
 ## status
 
@@ -142,10 +142,10 @@ Inside Claude Code, from a checkout of the private repo:
 /plugin install tidbit@tidbit
 ```
 
-From the private repo on GitHub, the plugin lives on the `claude-plugin` branch (made with `git subtree split --prefix=plugin -b claude-plugin`):
+From GitHub, the plugin-only public repo:
 
 ```
-/plugin marketplace add https://github.com/Teddy563/tidbitvideo.git#claude-plugin
+/plugin marketplace add Teddy563/tidbit
 /plugin install tidbit@tidbit
 ```
 

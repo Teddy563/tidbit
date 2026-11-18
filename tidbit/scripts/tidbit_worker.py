@@ -43,6 +43,7 @@ FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 # worker pairs only with a local or tailnet preview (loopback, 100.64.0.0/10, *.ts.net, a one-word host name).
 PINNED_PUBKEY = ""
 PROD_HOSTS = ("tidbit.video", "www.tidbit.video")
+BETA_KEYS = {"beta3.tidbit.video": "561d39f8f7b762d72a88524bb18727f407c8d1207b3767b8d4cbb74d11a61d86"}  # the beta preview's own job-signing key, pinned the same way
 DEADLINE_MAX = 3600  # a signed job may not claim more than an hour from now (tidbit leases for 10 minutes)
 
 
@@ -179,7 +180,10 @@ def check_server(server, pubkey=None):
     local = _local_host(host)
     if u.scheme == "http" and not local:
         raise ValueError("tidbit must be reached over https:// (plain http only for a preview on this computer or your tailnet).")
-    if pubkey is not None and not local:
+    if pubkey is not None and not local and host in BETA_KEYS:
+        if pubkey != BETA_KEYS[host]:
+            raise ValueError("The server handed out a signing key that is not tidbit's. Not pairing.")
+    elif pubkey is not None and not local:
         if not PINNED_PUBKEY:
             raise ValueError("This worker build has no pinned tidbit key yet, so it pairs only with a local or tailnet preview.")
         if host in PROD_HOSTS and pubkey != PINNED_PUBKEY:
