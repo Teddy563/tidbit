@@ -87,7 +87,7 @@ In claude.ai there is no folder to open. The tidbit prompt `start_project` loads
 
 ## auto-start
 
-Off unless the user chose it in `setup`. When a project is sent from tidbit and auto-start is on, the worker runs Claude in that project folder on the user's own login, with a 30 minute limit. If Claude is signed out, the daily limit is used up, or another run is going, the project waits and tidbit shows "Needs you". Change it with `PY W setup --auto-claude on|off --server ADDRESS --folder "~/tidbit"`. The run's log stays in `~/tidbit/.tidbit/runs/`. Stopping the job on tidbit stops the run.
+Off unless the user chose it in `setup`. When a project is sent from tidbit and auto-start is on, the worker runs Claude in that project folder on the user's own login, with a 30 minute limit, and tells tidbit where it stands (on your computer, working, needs you, done, failed). The Stop button on tidbit ends the run. If Claude is signed out, the daily limit is used up, or another run is going, the project waits and tidbit shows "Needs you". Change it with `PY W setup --auto-claude on|off --server ADDRESS --folder "~/tidbit"`. The run's log stays in `~/tidbit/.tidbit/runs/`. Stopping the job on tidbit stops the run.
 
 ## work
 

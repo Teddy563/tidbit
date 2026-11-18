@@ -1138,6 +1138,15 @@ def auto_counts(folder):
         return {}
 
 
+def track(c, folder, slug, state, note=""):
+    """Tell tidbit where an auto-start project stands (state on_computer, working, needs_you, done or failed). True when the user pressed Stop there."""
+    try:
+        pid = json.loads((project_path(folder, slug) / "project.json").read_text(encoding="utf-8"))["project_id"]
+        return bool(c.call("track", {"project_id": str(pid), "state": state, "note": scrub(note)[:300], "auto": True}).get("cancel"))
+    except Exception:
+        return False
+
+
 def auto_gate(folder, cfg, d, now=time.time):
     """None when Claude may start by itself for this project, else the plain reason it may not. Starts nothing."""
     h = claude_health(cfg)
@@ -1166,6 +1175,7 @@ def auto_run(folder, cfg, slug, d, c, jid, now=time.time):
         day = time.strftime("%Y-%m-%d", time.localtime(now()))
         (box / "auto_runs.json").write_text(json.dumps({day: auto_counts(folder).get(day, 0) + 1}), encoding="utf-8")
         c.call("progress", {"job_id": jid, "pct": 5, "log": "state: claude working"})
+        track(c, folder, slug, "working", "Claude is working on your computer")
         argv = [claude_path(cfg), "-p", "--permission-mode", "acceptEdits", "--allowedTools", AUTO_TOOLS]
         (box / "runs").mkdir(exist_ok=True)
         with open(box / "runs" / f"{slug}.log", "ab") as lg:  # stays on this computer
@@ -1185,6 +1195,8 @@ def auto_run(folder, cfg, slug, d, c, jid, now=time.time):
                             stop = ("cancelled", "Cancelled by you")
                     except Exception:
                         pass
+                    if track(c, folder, slug, "working", "Claude is working on your computer"):  # the Stop button on tidbit
+                        stop = ("cancelled", "Stopped by you")
                 if stop:
                     p.terminate()
                     try:
@@ -1207,13 +1219,17 @@ def run_open_project(job, folder, cfg, c=None):
         raise RuntimeError("That project is not in the tidbit folder on this computer. Send it to Claude again from tidbit.")
     extra = {}
     if (cfg or {}).get("autostart_claude") and c is not None:
+        track(c, folder, slug, "on_computer", "The project is in your tidbit folder")
         why = auto_gate(folder, cfg, d)
         if why is None:
             state, why = auto_run(folder, cfg, slug, d, c, job["id"])
             if state == "done":
+                track(c, folder, slug, "done", "Claude finished")
                 return {"slug": slug, "state": "done", "auto": True}
             if state in ("failed", "cancelled"):
+                track(c, folder, slug, "failed", why)
                 raise RuntimeError(why)
+        track(c, folder, slug, "needs_you", why)
         c.call("progress", {"job_id": job["id"], "pct": 5, "log": "state: needs you"})
         extra = {"state": "needs_you", "why": why}
     if (cfg or {}).get("open_in") != "cli" and (desktop_app() or extra):
