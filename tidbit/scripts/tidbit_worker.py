@@ -35,6 +35,18 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Cloudflare drops Python's default user agent (error 1010), so every call says who it is.
+urllib.request.install_opener(urllib.request.build_opener())
+urllib.request._opener.addheaders = [("User-Agent", "tidbit-worker/1")]
+
+if os.name == "nt" and sys.executable.lower().endswith("pythonw.exe"):  # autostart runs without a window: keep ffmpeg and claude from flashing one
+    _popen = subprocess.Popen
+
+    class _Quiet(_popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **{"creationflags": 0x08000000, **k})
+    subprocess.Popen = _Quiet
+
 CAPS = ["ping", "caption_clip", "make_project", "open_project", "pull_result", "prepare_clip", "render_video", "upload_render"]  # the helper never runs Claude: Claude work happens in the user's own session
 SYNC_MAX, SYNC_BYTES_HOUR, SYNC_GAP = 150 * 1024, 2 * 1024 * 1024, 2.0
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -1268,7 +1280,8 @@ def autostart_plan(folder, system=None, py=None, script=None, home=None):
     py, script = py or sys.executable, script or str(Path(__file__).resolve())
     if system == "Windows":  # the Startup folder needs no admin rights, unlike a schtasks logon task; write_text turns \n into \r\n there
         f = home / "AppData/Roaming/Microsoft/Windows/Start Menu/Programs/Startup/tidbit-worker.cmd"
-        return f, f'@chcp 65001 >nul\n@start "" "{Path(py).with_name("pythonw.exe")}" "{script}" run --folder "{folder}"\n', []
+        pw = Path(py).with_name("pythonw.exe")  # no console window; python.exe when this build has no pythonw
+        return f, f'@chcp 65001 >nul\n@start "" "{pw if os.name != "nt" or pw.is_file() else py}" "{script}" run --folder "{folder}"\n', []
     if system == "Darwin":
         f = home / "Library/LaunchAgents/video.tidbit.worker.plist"
         args = "".join(f"<string>{x}</string>" for x in (py, script, "run", "--folder", str(folder)))
@@ -1293,6 +1306,14 @@ def unautostart_plan(system=None, home=None):
     return home / ".config/systemd/user/tidbit-worker.service", [["systemctl", "--user", "disable", "--now", "tidbit-worker.service"]]
 
 
+def alive_age(folder):
+    """Seconds since the running worker last wrote its heartbeat file, or None when it never did."""
+    try:
+        return time.time() - json.loads((tdir(folder) / "alive.json").read_text())["t"]
+    except Exception:
+        return None
+
+
 def install_autostart(a):
     folder = Path(a.folder).expanduser().resolve()
     load(folder)
@@ -1301,6 +1322,9 @@ def install_autostart(a):
     if f:
         f.parent.mkdir(parents=True, exist_ok=True)
         f.write_text(text, encoding="utf-8")
+    if f and platform.system() == "Windows":  # the Startup folder only runs at the next sign-in, so start it now too (once)
+        if alive_age(folder) is None or alive_age(folder) > 60:
+            subprocess.Popen(["cmd", "/c", str(f)], creationflags=0x08000000, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for cmd in cmds[:-1]:
         subprocess.run(cmd, capture_output=True)
     r = subprocess.run(cmds[-1], capture_output=True, text=True) if cmds else None
@@ -1325,10 +1349,7 @@ def doctor(a):
     cfg = load(folder, False)
     ok = lambda good, msg: print(("ok    " if good else "FIX   ") + msg)
     ok(bool(cfg), f"paired in {folder}" if cfg else "not paired here. Get a code on tidbit's Connections page, then: python tidbit_worker.py pair CODE --server ADDRESS")
-    try:
-        age = time.time() - json.loads((tdir(folder) / "alive.json").read_text())["t"]
-    except Exception:
-        age = None
+    age = alive_age(folder)
     ok(age is not None and age < 60, "worker running" if age is not None and age < 60 else "worker not running. Start it with: python tidbit_worker.py run, or make it start by itself with: python tidbit_worker.py install-autostart")
     h = claude_health(cfg)
     ok(h["ready"], claude_line(h) + (f" at {h['path']}" if h["path"] else ""))
