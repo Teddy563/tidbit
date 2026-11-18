@@ -1,7 +1,7 @@
 {
   "name": "tidbit",
-  "version": "0.5.1",
-  "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, and what's waiting for you.",
+  "version": "0.6.0",
+  "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, a library of reusable clips, and what's waiting for you.",
   "author": {
     "name": "tidbit"
   },

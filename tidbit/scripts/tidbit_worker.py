@@ -11,7 +11,7 @@ It runs Claude only in your own open Claude session, unless you switch on "start
   python tidbit_worker.py outbox KIND REF file.json --folder ~/tidbit    (queue a small result to sync)
 
 Python 3.9+, standard library only (ffmpeg only for clip and render jobs). Windows, macOS, Linux.
-Videos, frames and project files stay in <folder>/projects, inbox and jobs. Only small results (cards, tags, design
+Videos, frames and project files stay in the folder (inbox, raw, clips, projects, renders, photos, audio, jobs). Only small results (cards, tags, design
 notes, thumbnails up to 150 KB) are ever sent, slowly, in the background, and only while sync is on in tidbit and here.
 """
 import argparse
@@ -342,10 +342,18 @@ README = """This is your tidbit folder.
 
 tidbit keeps research, plans and results on tidbit.video. Your own clips and finished videos stay here.
 
-  inbox/      put your own clips here. Nothing leaves this computer unless a job you started uses it.
-  projects/   one folder per tidbit project: BRIEF.md, CLAUDE.md, plan, scripts, clips, renders, results.
-  jobs/       working space for one job. A job folder is deleted 7 days after it finishes.
-  .tidbit/    settings, the key to your tidbit account, and a log. Do not share it.
+  inbox/            new files, not sorted yet. Put your own clips here. Nothing leaves this computer unless a job you started uses it.
+  raw/              your original takes, kept as they are.
+  clips/<topic>/    clips worth using again, one folder per topic or format (hooks, before-after, b-roll ...).
+  projects/         one folder per tidbit project: BRIEF.md, CLAUDE.md, plan, scripts, clips, renders, results.
+  renders/          finished videos that do not belong to one project.
+  photos/           pictures.
+  audio/            voice-overs, music, sounds.
+  jobs/             working space for one job. A job folder is deleted 7 days after it finishes.
+  .tidbit/          settings, the key to your tidbit account, your clip tags and a log. Do not share it.
+
+With syncing on, tidbit's Library shows a list of these files (name, size, length, a tiny picture, tags, a score for how
+reusable a clip is). Never the files themselves. The Library holds up to 25 GB.
 
 To work on a project, open it from its page on tidbit.video, or run claude inside its folder.
 tidbit only reads and writes inside this folder.
@@ -359,7 +367,7 @@ def init_folder(folder):
     """The layout from the plan, safe to run again. Also keeps a copy of this worker in the folder, so autostart does not
     depend on where the plugin lives."""
     folder = Path(folder).expanduser().resolve()
-    for sub in ("inbox", "projects", "library/clips", "jobs", ".tidbit/outbox", ".tidbit/seen"):
+    for sub in ("inbox", "raw", "clips", "projects", "renders", "photos", "audio", "jobs", ".tidbit/outbox", ".tidbit/seen"):
         (folder / sub).mkdir(parents=True, exist_ok=True)
     if not (folder / "README.txt").exists():
         (folder / "README.txt").write_text(README, encoding="utf-8")
@@ -902,12 +910,12 @@ def run_pull_result(job, folder):
 # ---------- local footage: shots and clips. The user's own Claude Code runs these through Bash, on the user's request; nothing is uploaded ----------
 
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,60}")
-LOCAL_OK = re.compile(r"(inbox|library)/.+|projects/[a-z0-9-]{1,80}/(clips|renders)/.+")
+LOCAL_OK = re.compile(r"(inbox|raw|clips|renders|photos|audio|library)/.+|projects/[a-z0-9-]{1,80}/(clips|renders)/.+")
 
 
-def local_file(folder, rel):
-    """A video inside the tidbit folder, named by a relative path under inbox/, library/ or projects/<slug>/clips|renders/. Absolute paths,
-    '..' and links that lead out of the folder are refused."""
+def local_file(folder, rel, exists=True):
+    """A file inside the tidbit folder, named by a relative path under inbox/, raw/, clips/, renders/, photos/, audio/, library/ (the old
+    place for clips) or projects/<slug>/clips|renders/. Absolute paths, '..' and links that lead out of the folder are refused."""
     rel = str(rel or "")
     root = Path(folder).expanduser().resolve()
     if not rel or Path(rel).is_absolute() or ".." in Path(rel).parts or "\0" in rel or re.match(r"[A-Za-z]:", rel):
@@ -915,8 +923,8 @@ def local_file(folder, rel):
     f = (root / rel).resolve()
     inside = root in f.parents and LOCAL_OK.fullmatch(f.relative_to(root).as_posix())
     if not inside:
-        raise RuntimeError("That file is not in inbox, library or a project's clips or renders folder, so tidbit will not open it.")
-    if not f.is_file():
+        raise RuntimeError("That file is not in one of your tidbit folders (inbox, raw, clips, renders, photos, audio or a project's clips or renders), so tidbit will not open it.")
+    if exists and not f.is_file():
         raise RuntimeError(f"There is no file called {rel} in your tidbit folder.")
     return root, f
 
@@ -1052,7 +1060,7 @@ def run_shots(a):
 
 
 def run_cut(a):
-    """Cut [from, to] out of one video into a project's clips/ or into library/clips/ (with a line in index.json)."""
+    """Cut [from, to] out of one video into a project's clips/ or into clips/<topic>/ (with a line in index.json), and keep its tags."""
     root, f = local_file(a.folder, a.file)
     if not NAME_RE.fullmatch(a.name or ""):
         raise RuntimeError("Name the clip with lowercase letters, numbers and dashes only, like hook-01.")
@@ -1065,7 +1073,10 @@ def run_cut(a):
             raise RuntimeError("That project is not in your tidbit folder.")
         out = root / "projects" / a.project / "clips"
     else:
-        out = root / "library" / "clips"
+        topic = a.topic or "general"
+        if not NAME_RE.fullmatch(topic):
+            raise RuntimeError("Name the topic with lowercase letters, numbers and dashes only, like hooks.")
+        out = root / "clips" / topic
     out.mkdir(parents=True, exist_ok=True)
     dest = unique(out / f"{a.name}.mp4")
     build = lambda enc: ["-ss", f"{s:.3f}", "-i", str(f), "-t", f"{e - s:.3f}", *["18" if x == "21" else x for x in enc], "-pix_fmt", "yuv420p",
@@ -1083,7 +1094,154 @@ def run_cut(a):
             rows = []
         rows.append({"name": dest.stem, "source": f.relative_to(root).as_posix(), "t0": round(s, 2), "t1": round(e, 2), "made_at": int(time.time())})
         idx.write_text("[\n" + ",\n".join(json.dumps(r) for r in rows) + "\n]\n", encoding="utf-8")
+    if a.tags is not None or a.score is not None or a.use is not None:
+        set_meta(root, dest.relative_to(root).as_posix(), a.tags, a.score, a.use)
     print(dest.relative_to(root).as_posix())
+
+
+# ---------- the library: the files in the tidbit folder with tags and a reuse score. tidbit's Library gets one small row per file, never the file ----------
+
+LIB_LIMIT = 25 * 2**30  # what tidbit's Library keeps per account
+ASSET_EXT = {"video": (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"), "photo": (".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"),
+             "audio": (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"), "other": (".srt", ".vtt", ".ass", ".pdf", ".svg", ".psd", ".ttf", ".otf", ".cube")}
+TAG_RE = re.compile(r"[a-z0-9][a-z0-9 -]{0,23}")
+
+
+def lib_file(folder, name):
+    try:
+        return json.loads((tdir(folder) / name).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def lib_save(folder, name, data):
+    (tdir(folder) / name).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+
+
+def set_meta(root, rel, tags=None, score=None, use=None):
+    """Tags (comma list), score (0 to 100, how reusable) and a one-line use note for one file, kept in .tidbit/library.json."""
+    cur = lib_file(root, "library.json").get(rel) or {}
+    if tags is not None:
+        tl = [t.strip().lower() for t in tags.split(",") if t.strip()]
+        if not tl or len(tl) > 8 or not all(TAG_RE.fullmatch(t) for t in tl):
+            raise RuntimeError("Give one to eight tags, separated by commas: lowercase letters, numbers, spaces and dashes, up to 24 characters each.")
+        cur["tags"] = list(dict.fromkeys(tl))
+    if score is not None:
+        if not 0 <= score <= 100:
+            raise RuntimeError("The score is a number from 0 to 100.")
+        cur["score"] = int(score)
+    if use is not None:
+        cur["use"] = " ".join(use.split())[:140]
+    m = lib_file(root, "library.json")
+    m[rel] = cur
+    lib_save(root, "library.json", m)
+
+
+def run_tag(a):
+    root, f = local_file(a.folder, a.file)
+    set_meta(root, f.relative_to(root).as_posix(), a.tags, a.score, a.use)
+    print(f"tagged {f.relative_to(root).as_posix()}")
+
+
+def run_move(a):
+    """Move one file to another place inside the tidbit folder. Its tags go with it. Nothing is overwritten."""
+    root, f = local_file(a.folder, a.src)
+    _, dest = local_file(a.folder, a.dest, exists=False)
+    if dest.exists():
+        raise RuntimeError(f"There is already a file at {a.dest}.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(f), str(dest))
+    a_rel, b_rel = f.relative_to(root).as_posix(), dest.relative_to(root).as_posix()
+    m = lib_file(root, "library.json")
+    if a_rel in m:
+        m[b_rel] = m.pop(a_rel)
+        lib_save(root, "library.json", m)
+    print(b_rel)
+
+
+def scan_assets(root):
+    """(relative path, path, type) of every media file the library lists. Hidden folders, jobs/, shots/ and project text are left out."""
+    for dp, dn, fn in os.walk(root):
+        dn[:] = sorted(d for d in dn if not d.startswith(".") and d not in ("jobs", "shots"))
+        for n in sorted(fn):
+            p = Path(dp) / n
+            kind = next((k for k, v in ASSET_EXT.items() if p.suffix.lower() in v), None)
+            rel = p.relative_to(root).as_posix()
+            if kind and len(rel) <= 120 and not n.startswith(".") and not p.is_symlink() and LOCAL_OK.fullmatch(rel):
+                yield rel, p, kind
+
+
+def thumb_of(path, secs=0.0):
+    """A 96 px wide JPEG as a data link, or None (no ffmpeg, or a file it cannot read)."""
+    for ss in ([["-ss", f"{min(1.0, secs / 2):.2f}"]] if secs else []) + [[]]:
+        try:
+            r = subprocess.run(["ffmpeg", "-v", "error", *ss, "-i", str(path), "-frames:v", "1", "-vf", "scale=96:-2", "-q:v", "9", "-f", "image2pipe", "-c:v", "mjpeg", "-"],
+                               capture_output=True, timeout=30)
+        except Exception:
+            return None
+        if r.stdout and len(r.stdout) < 20_000:
+            return "data:image/jpeg;base64," + base64.b64encode(r.stdout).decode()
+    return None
+
+
+def catalog_queue(folder, everything=False):
+    """Queue what changed since the last time as rows for tidbit's Library (kind asset). Best clips first, nothing past 25 GB.
+    Returns (files, queued, gone, over, bytes)."""
+    root = Path(folder).expanduser().resolve()
+    meta, state, rows = lib_file(root, "library.json"), lib_file(root, "library-state.json"), []
+    for rel, p, kind in scan_assets(root):
+        try:
+            s = p.stat()
+        except OSError:
+            continue
+        sig, c = f"{s.st_size}:{int(s.st_mtime)}", state.get(rel) or {}
+        if c.get("sig") != sig:
+            dur = probe(p)[0] if kind in ("video", "audio") else 0.0
+            c = {"sig": sig, "dur": round(dur, 1), "thumb": thumb_of(p, dur) if kind in ("video", "photo") else None, "sent": c.get("sent")}
+        state[rel] = c
+        m = meta.get(rel) or {}
+        rows.append({"path": rel, "type": kind, "size": s.st_size, "duration_s": c["dur"], "thumb": c["thumb"], "tags": m.get("tags", []),
+                     "score": m.get("score", 0), "use": m.get("use", ""), "mtime": int(s.st_mtime)})
+    rows.sort(key=lambda r: (-r["score"], -r["mtime"]))
+    queued = over = total = 0
+    for r in rows:
+        total += r["size"]
+        if total > LIB_LIMIT:
+            over += 1
+            continue
+        h = hashlib.sha1(json.dumps(r, sort_keys=True).encode()).hexdigest()[:16]
+        if everything or state[r["path"]].get("sent") != h:
+            outbox_put(root, "asset", r["path"], r)
+            state[r["path"]]["sent"] = h
+            queued += 1
+    here = {r["path"] for r in rows}
+    gone = [k for k in state if k not in here]
+    for k in gone:
+        outbox_put(root, "asset", k, {"gone": True})
+        del state[k]
+    lib_save(root, "library-state.json", state)
+    return len(rows), queued, len(gone), over, total
+
+
+def run_catalog(a):
+    files, queued, gone, over, total = catalog_queue(a.folder, a.all)
+    print(f"{files} file{'s' if files != 1 else ''}, {total / 2**30:.1f} GB. {queued} new or changed, {gone} removed.")
+    if over:
+        print(f"Your folder holds more than the 25 GB the Library keeps, so {over} file{'s' if over != 1 else ''} stay out. Clips with the best scores go in first.")
+    cfg = load(a.folder, False) or {}
+    if not cfg.get("sync"):
+        print("Syncing is off on this computer, so tidbit's Library stays empty. Turn it on in Connections on tidbit.")
+
+
+def library_loop(folder, st):
+    """Every ten minutes, while syncing is on: look for new, changed and removed files. A first look at a big folder can take a while."""
+    while not st.stop:
+        try:
+            if st.sync_server and load(folder).get("sync"):
+                catalog_queue(folder)
+        except Exception:
+            pass
+        time.sleep(600)
 
 
 def terminal_argv(system, d, claude, which=shutil.which):
@@ -1343,6 +1501,7 @@ def sync_loop(c, cfg, folder, st):
                 c.call("sync", json.loads(raw))
             except Fail as e:
                 if e.code in (400, 413):  # tidbit will never take this one
+                    log(folder, f"sync refused: {e}")
                     (box / "rejected").mkdir(exist_ok=True)
                     files[0].replace(box / "rejected" / files[0].name)
                 continue
@@ -1373,6 +1532,7 @@ def run(a):
     c, st = Client(cfg["server"], cfg["key"], cfg["name"]), State()
     threading.Thread(target=heartbeat_loop, args=(c, cfg, folder, st), daemon=True).start()
     threading.Thread(target=sync_loop, args=(c, cfg, folder, st), daemon=True).start()
+    threading.Thread(target=library_loop, args=(folder, st), daemon=True).start()
     print(f"tidbit worker is running for {cfg['name']}. Leave this window open. Ctrl+C stops it.", flush=True)
     log(folder, "worker started")
     while True:
@@ -1673,7 +1833,7 @@ def main(argv=None):
     st.add_argument("--auto-claude", choices=("on", "off"), help="start Claude by itself in a project folder when you send a project (off unless you turn it on)")
     st.add_argument("--auto-daily", type=int, help="most automatic Claude runs a day (default 10)")
     sh = sub.add_parser("shots")
-    sh.add_argument("file", help="a video under inbox/, library/ or projects/<slug>/clips|renders/")
+    sh.add_argument("file", help="a video in the tidbit folder, like inbox/take.mp4 or clips/hooks/hook-01.mp4")
     sh.add_argument("--folder", default="~/tidbit")
     sh.add_argument("--threshold", type=float, default=0.3)
     sh.add_argument("--min", type=float, default=0.8)
@@ -1684,7 +1844,24 @@ def main(argv=None):
     cu.add_argument("--to", dest="end", type=float, required=True)
     cu.add_argument("--name", required=True)
     cu.add_argument("--project")
+    cu.add_argument("--topic", help="the clips/<topic> folder for a reusable clip (default general)")
+    cu.add_argument("--tags")
+    cu.add_argument("--score", type=int)
+    cu.add_argument("--use")
     cu.add_argument("--folder", default="~/tidbit")
+    tg = sub.add_parser("tag")
+    tg.add_argument("file")
+    tg.add_argument("--tags")
+    tg.add_argument("--score", type=int)
+    tg.add_argument("--use")
+    tg.add_argument("--folder", default="~/tidbit")
+    mv = sub.add_parser("move")
+    mv.add_argument("src")
+    mv.add_argument("dest")
+    mv.add_argument("--folder", default="~/tidbit")
+    ct = sub.add_parser("catalog")
+    ct.add_argument("--all", action="store_true", help="send every row again")
+    ct.add_argument("--folder", default="~/tidbit")
     rd = sub.add_parser("ready")
     rd.add_argument("--done")
     rd.add_argument("--folder", default="~/tidbit")
@@ -1708,9 +1885,9 @@ def main(argv=None):
             mcp_add(cfg["server"], cfg["key"], cfg, a.folder)
         elif a.cmd in ("login", "doctor", "hook"):
             {"login": login, "doctor": doctor, "hook": hook}[a.cmd](a)
-        elif a.cmd in ("shots", "cut"):
+        elif a.cmd in ("shots", "cut", "tag", "move", "catalog"):
             try:
-                {"shots": run_shots, "cut": run_cut}[a.cmd](a)
+                {"shots": run_shots, "cut": run_cut, "tag": run_tag, "move": run_move, "catalog": run_catalog}[a.cmd](a)
             except RuntimeError as e:
                 sys.exit(f"tidbit: {e}")
         elif a.cmd == "setup":

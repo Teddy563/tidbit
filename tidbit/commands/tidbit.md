@@ -1,6 +1,6 @@
 ---
-description: tidbit on this computer. setup | CODE | check CODE | pair CODE | status | project | work | shots | clips | structure | login | fix
-argument-hint: setup | CODE | status | project | work | shots | clips | structure | login | fix
+description: tidbit on this computer. setup | CODE | check CODE | pair CODE | status | project | work | shots | clips | structure | library | organize | find-clips | login | fix
+argument-hint: setup | CODE | status | project | work | shots | clips | structure | library | organize | find-clips | login | fix
 ---
 
 Use the `tidbit` skill from this plugin and follow its section for: $ARGUMENTS

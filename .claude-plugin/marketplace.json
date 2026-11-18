@@ -8,7 +8,7 @@
     {
       "name": "tidbit",
       "source": "./tidbit",
-      "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, and what's waiting for you."
+      "description": "tidbit for Claude Code: your tidbit tools, your tidbit folder, your best shots and clips, a library of reusable clips, and what's waiting for you."
     }
   ]
 }
