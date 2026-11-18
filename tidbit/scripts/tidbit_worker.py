@@ -431,6 +431,15 @@ def claude_path(cfg=None):
     return None
 
 
+def desktop_app(system=None, env=None, home=None):
+    """True when the Claude desktop app is installed: its install folder on Windows (installer or Store package) or Claude.app on macOS. Starts nothing."""
+    system, env, home = system or platform.system(), os.environ if env is None else env, Path(home or Path.home())
+    if system == "Windows":
+        base = env.get("LOCALAPPDATA")
+        return bool(base) and ((Path(base) / "AnthropicClaude").is_dir() or any(Path(base).glob("Packages/*Claude_*")))
+    return system == "Darwin" and any((d / "Claude.app").is_dir() for d in (Path("/Applications"), home / "Applications"))
+
+
 _HEALTH = {}
 INSTALL = "irm https://claude.ai/install.ps1 | iex" if os.name == "nt" else "curl -fsSL https://claude.ai/install.sh | bash"
 
@@ -441,7 +450,7 @@ def claude_health(cfg=None, now=time.time):
     hit = _HEALTH.get(c)
     if hit and now() - hit[0] < 300:
         return hit[1]
-    h = {"installed": bool(c), "version": None, "logged_in": False, "auth_method": None, "path": c}
+    h = {"installed": bool(c), "version": None, "logged_in": False, "auth_method": None, "path": c, "desktop": desktop_app()}
     if c:
         def out(*args):
             try:
@@ -454,12 +463,15 @@ def claude_health(cfg=None, now=time.time):
             h["logged_in"], h["auth_method"] = bool(st.get("loggedIn")), st.get("authMethod")
         except (ValueError, AttributeError):
             h["logged_in"] = None
-    h["ready"] = bool(h["installed"] and h["version"] and h["logged_in"] is not False)
+    h["terminal_ready"] = bool(h["installed"] and h["version"] and h["logged_in"] is not False)
+    h["ready"] = bool(h["desktop"] or h["terminal_ready"])  # the desktop app signs in by itself; only the terminal needs claude auth login
     _HEALTH[c] = (now(), h)
     return h
 
 
 def claude_line(h):
+    if h.get("desktop"):
+        return "Claude is ready (desktop app)" + (". The terminal version is signed out; that only matters if you use it, then run: claude auth login" if h["installed"] and h["logged_in"] is False else "")
     if not h["installed"]:
         return "Claude Code was not found on this computer. Install it with: " + INSTALL
     if h["logged_in"] is False:
@@ -469,7 +481,8 @@ def claude_line(h):
 
 def heartbeat_claude(cfg):
     h = claude_health(cfg)
-    return {"installed": h["installed"], "version": h["version"], "logged_in": h["logged_in"], "ready": h["ready"], "mode": "background"}
+    return {"installed": h["installed"], "version": h["version"], "logged_in": h["logged_in"], "ready": h["ready"], "mode": "background",
+            "desktop": h["desktop"], "ffmpeg": bool(shutil.which("ffmpeg"))}  # the card on tidbit reads these; nothing else leaves
 
 
 def _oauth_mcp(server):
@@ -1085,12 +1098,39 @@ def terminal_argv(system, d, claude, which=shutil.which):
     return None
 
 
+def ready_list(folder):
+    """Slugs of projects waiting to be opened from a Claude session (desktop app users), skipping folders that are gone."""
+    try:
+        got = json.loads((tdir(folder) / "ready.json").read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    return [x for x in got if isinstance(x, str) and re.fullmatch(r"[a-z0-9-]{1,80}", x) and project_path(folder, x).is_dir()]
+
+
+def ready_set(folder, slug, on=True):
+    now = [x for x in ready_list(folder) if x != slug] + ([slug] if on else [])
+    (tdir(folder) / "ready.json").write_text(json.dumps(now), encoding="utf-8")
+
+
+def ready(a):
+    """`ready` lists the projects waiting to be opened (slug and path); `ready --done SLUG` takes one off the list."""
+    folder = Path(a.folder).expanduser().resolve()
+    if a.done:
+        ready_set(folder, a.done, False)
+    for slug in ready_list(folder):
+        print(slug, project_path(folder, slug))
+
+
 def run_open_project(job, folder, cfg):
-    """Open a terminal running the user's claude in one project folder. The job names a project; it never carries a command."""
+    """Open a terminal running the user's claude in one project folder. The job names a project; it never carries a command.
+    With the Claude desktop app installed no window opens: the project waits in ready.json and the next session says so."""
     slug = str(job["params"].get("slug") or "")
     d = project_path(folder, slug) if re.fullmatch(r"[a-z0-9-]{1,80}", slug) else None
     if not (d and d.is_dir()):
         raise RuntimeError("That project is not in the tidbit folder on this computer. Send it to Claude again from tidbit.")
+    if (cfg or {}).get("open_in") != "cli" and desktop_app():
+        ready_set(folder, slug)
+        return {"ready": slug, "app": "desktop"}
     c = claude_path(cfg)
     if not c:
         raise RuntimeError("Claude Code was not found on this computer. Install it with: " + INSTALL)
@@ -1401,6 +1441,9 @@ def hook(a):
             print("tidbit: worker running, but Claude Code is signed out. Run /tidbit login.")
         else:
             print("tidbit: worker running, Claude ready.")
+        rp = ready_list(folder)
+        if rp:
+            print(f"{len(rp)} project{'s' if len(rp) != 1 else ''} ready: {', '.join(rp)}. Say /tidbit work to open {'them' if len(rp) != 1 else 'it'}.")
         cfg = load(folder, False)
         info = {}
         n = hello(folder, cfg, info) if cfg and cfg.get("key") else None
@@ -1464,6 +1507,9 @@ def main(argv=None):
     cu.add_argument("--name", required=True)
     cu.add_argument("--project")
     cu.add_argument("--folder", default="~/tidbit")
+    rd = sub.add_parser("ready")
+    rd.add_argument("--done")
+    rd.add_argument("--folder", default="~/tidbit")
     o = sub.add_parser("outbox")
     o.add_argument("kind")
     o.add_argument("ref")
@@ -1489,6 +1535,8 @@ def main(argv=None):
                 {"shots": run_shots, "cut": run_cut}[a.cmd](a)
             except RuntimeError as e:
                 sys.exit(f"tidbit: {e}")
+        elif a.cmd == "ready":
+            ready(a)
         elif a.cmd == "install-autostart":
             install_autostart(a)
         elif a.cmd == "uninstall-autostart":
