@@ -159,6 +159,27 @@ def seen_before(folder, jid):
 
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(\.[\w-]+)+")
 _KEYS = re.compile(r"\b(tid_[\w-]{20,}|sk-ant-[\w-]{10,}|sk-[\w-]{20,})")
+# Secrets in free text: well-known key shapes, name=value for anything that sounds secret, NAME=value lines of a .env file, Bearer tokens, JWTs,
+# keys in a URL, and long hex or base64 strings. Over-hiding a word is fine; leaking a key is not.
+_SECRET = re.compile("|".join((
+    r"-----BEGIN [A-Z ]*-----",
+    r"\b(?:AKIA|ASIA|AGPA|AIDA|AROA)[0-9A-Z]{16}\b",  # AWS access key ids
+    r"\bAIza[\w-]{30,}",  # Google API keys
+    r"\bya29\.[\w.-]{20,}",  # Google OAuth tokens
+    r"\b(?:gh[pousr]_|github_pat_|glpat-|npm_|xox[abprs]-|[sr]k_(?:live|test)_|SG\.|hf_)[\w.-]{10,}",
+    r"\beyJ[\w-]{5,}\.[\w-]{5,}\.[\w-]{3,}",  # JWT
+    r"(?i:\bbearer\s+[\w.~+/=-]{8,})",
+    r"(?i:\b[\w.-]*(?:key|token|secret|passw(?:or)?d|pwd|credential|authorization)[\w.-]*[\"']?\s*[=:]\s*[\"']?[^\s\"',;]{6,})",
+    r"\b[A-Z][A-Z0-9_]{2,}=\S+",  # a .env line
+    r"(?<=://)[^\s/:@]+:[^\s/@]+(?=@)",  # user:password in a URL
+    r"\b[0-9a-fA-F]{32,}\b",  # long hex
+)))
+_B64 = re.compile(r"[A-Za-z0-9+/_=-]{32,}")
+
+
+def _long_secret(m):
+    t = m.group(0)
+    return "[hidden]" if sum(bool(re.search(r, t)) for r in ("[a-z]", "[A-Z]", "[0-9]")) == 3 else t  # a path or a plain word has fewer kinds of character
 
 
 def scrub(text, key=""):
@@ -166,6 +187,8 @@ def scrub(text, key=""):
     if key:
         text = text.replace(key, "[key]")
     text = _KEYS.sub("[key]", text)
+    text = _SECRET.sub("[hidden]", text)
+    text = _B64.sub(_long_secret, text)
     text = _EMAIL.sub("[email]", text)
     home = str(Path.home())
     if len(home) > 1:
@@ -1490,7 +1513,7 @@ def ready(a):
 
 
 # Opt-in: with autostart_claude on in config.json, a project opened from tidbit runs `claude -p` in its folder on the user's own login.
-AUTO_MIN, AUTO_DAILY, AUTO_POLL = 30, 10, 5
+AUTO_MIN, AUTO_DAILY, AUTO_POLL = 30, 10, 3
 AUTO_TOOLS = "Read,Write,Edit,Glob,Grep,mcp__tidbit,mcp__plugin_tidbit_tidbit"  # files in the project folder (acceptEdits) and the tidbit tools; no shell
 AUTO_TASK = ("Read BRIEF.md and CLAUDE.md in this folder, then do the work they describe. Stay in this folder. Use the tidbit tools for data and "
              "save results the way CLAUDE.md says. If a step costs credits or needs the user's decision, stop and say what you need.")
@@ -1525,8 +1548,76 @@ def auto_gate(folder, cfg, d, now=time.time):
     return None
 
 
+SERVER = {"show_session": False, "auto_pause": False, "seen": False}  # tidbit's side of two switches on the Jobs page, learned from the heartbeat. seen: tidbit has answered at least once
+TOOL_WORDS = {"Glob": "Looking for files", "Grep": "Searching the project", "search_library": "Searching your library", "search_posts": "Searching videos",
+              "report_progress": "Telling tidbit where it stands", "save_plan": "Saving the plan", "save_script": "Saving the script", "attach_render": "Noting the render"}
+TOOL_FILE = {"Read": "Reading", "Write": "Writing", "Edit": "Editing"}
+
+
+def short_path(path, root=None):
+    """A file as the page shows it: cut to the project folder. A file outside the folder is not named at all."""
+    path = str(path or "").replace("\\", "/")
+    if not path:
+        return ""
+    if root is None:
+        return os.path.basename(path)
+    try:
+        return Path(os.path.realpath(Path(root) / path)).relative_to(os.path.realpath(root)).as_posix()  # an absolute path wins over root in the join
+    except ValueError:
+        return "a file outside the project"
+
+
+def tool_words(name, inp, root=None):
+    """A tool call in plain words. Only the tool and a short path leave the computer, never what the tool read."""
+    short = str(name).split("__")[-1]
+    if short in TOOL_FILE:
+        f = short_path((inp or {}).get("file_path"), root)
+        return f"{TOOL_FILE[short]} {f}" if f else f"{TOOL_FILE[short]} a file"
+    return TOOL_WORDS.get(short) or ("Using a tidbit tool" if str(name).startswith("mcp__") else "Working")
+
+
+def parse_event(line, root=None):
+    """One line of `claude -p --output-format stream-json` -> [(kind, text)] with kind say, tool, think or done. Anything else is dropped."""
+    try:
+        e = json.loads(line)
+    except ValueError:
+        return []
+    if not isinstance(e, dict):
+        return []
+    if e.get("type") == "result":
+        return [("done", " ".join(scrub(str(e.get("result") or ("Claude stopped with an error" if e.get("is_error") else "Claude finished"))).split())[:400])]
+    out = []
+    if e.get("type") == "assistant":
+        for b in ((e.get("message") or {}).get("content") or []):
+            if not isinstance(b, dict):
+                continue
+            if b.get("type") == "text" and str(b.get("text") or "").strip():
+                out.append(("say", b["text"]))
+            elif b.get("type") == "thinking" and str(b.get("thinking") or "").strip():
+                out.append(("think", b["thinking"]))
+            elif b.get("type") == "tool_use":
+                out.append(("tool", tool_words(b.get("name"), b.get("input"), root)))
+    return [(k, " ".join(scrub(x).split())[:400]) for k, x in out]  # redact before the lines are joined, so a .env line is still a line
+
+
+def user_line(text):
+    return (json.dumps({"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}, ensure_ascii=False) + "\n").encode()
+
+
+NOTE_FROM = "A note from the user, typed on their tidbit Jobs page. Follow it for this project: "
+
+
+def project_id_of(folder, slug):
+    try:
+        return str(json.loads((project_path(folder, slug) / "project.json").read_text(encoding="utf-8"))["project_id"])
+    except Exception:
+        return ""
+
+
 def auto_run(folder, cfg, slug, d, c, jid, now=time.time, approved=()):
-    """One headless Claude run in the project folder, one at a time. Returns (state, note): done, failed, cancelled or needs_you."""
+    """One headless Claude run in the project folder, one at a time. Returns (state, note): done, failed, cancelled or needs_you.
+    The run talks stream-json both ways: the whole output goes to .tidbit/runs/<slug>.log here; a short list of what Claude said and did goes to
+    tidbit only while the user's "Show my Claude session in tidbit" switch is on; the user's notes from the Jobs page are written to Claude's input."""
     box = tdir(folder)
     lock = box / "auto.lock"
     limit = int(cfg.get("auto_minutes") or AUTO_MIN) * 60
@@ -1541,20 +1632,67 @@ def auto_run(folder, cfg, slug, d, c, jid, now=time.time, approved=()):
         (box / "auto_runs.json").write_text(json.dumps({day: auto_counts(folder).get(day, 0) + 1}), encoding="utf-8")
         c.call("progress", {"job_id": jid, "pct": 5, "log": "state: claude working"})
         track(c, folder, slug, "working", "Claude is working on your computer")
-        argv = [claude_path(cfg), "-p", "--permission-mode", "acceptEdits", "--allowedTools", AUTO_TOOLS]
+        argv = [claude_path(cfg), "-p", "--verbose", "--output-format", "stream-json", "--input-format", "stream-json", "--permission-mode", "acceptEdits", "--allowedTools", AUTO_TOOLS]
         (box / "runs").mkdir(exist_ok=True)
-        with open(box / "runs" / f"{slug}.log", "ab") as lg:  # stays on this computer
-            p = subprocess.Popen(argv, cwd=d, stdin=subprocess.PIPE, stdout=lg, stderr=subprocess.STDOUT)
+        pid = project_id_of(folder, slug)
+        pending, finished, lk = [], threading.Event(), threading.Lock()
+        with open(box / "runs" / f"{slug}.log", "ab") as lg:  # the whole stream stays on this computer
+            p = subprocess.Popen(argv, cwd=d, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+            def read():
+                for raw in p.stdout:
+                    lg.write(raw)
+                    lg.flush()
+                    evs = parse_event(raw.decode("utf-8", "replace"), d)
+                    with lk:
+                        pending.extend((k, x, time.time()) for k, x in evs)
+                    if any(k == "done" for k, _ in evs):
+                        finished.set()
+            rd = threading.Thread(target=read, daemon=True)
+            rd.start()
             ok = [x for x in approved if x in ("research", "film", "edit", "post")]  # the steps the user approved on the Autopilot board
-            p.stdin.write((AUTO_TASK + (f" The user approved these steps on their Autopilot board: {', '.join(ok)}. Carry on with the step after them." if ok else "")).encode())
-            p.stdin.close()
+            p.stdin.write(user_line(AUTO_TASK + (f" The user approved these steps on their Autopilot board: {', '.join(ok)}. Carry on with the step after them." if ok else "")))
+            p.stdin.flush()
             t0 = last = now()
+            acks, lost, talk = [], [], True  # talk: tidbit answers the session call. Streaming is best effort: when it does not (an older tidbit, no such project), the run goes on without it.
+
+            def say(batch, take=True):
+                nonlocal acks, lost
+                r = c.call("session", {"project_id": pid, "ack": acks, "failed": lost, "take": take,
+                                       "events": [{"k": k, "x": x, "t": t} for k, x, t in batch] if SERVER["show_session"] else []})
+                acks, lost = [], []
+                SERVER["show_session"] = bool(r.get("show"))
+                return r
             while p.poll() is None:
                 time.sleep(AUTO_POLL)
                 stop = None
+                with lk:  # always drained, so nothing piles up when tidbit does not answer
+                    batch, pending[:] = pending[:40], pending[40:]
+                if talk:
+                    try:
+                        r = say(batch, take=not p.stdin.closed)
+                        for m in r.get("messages") or []:
+                            try:
+                                p.stdin.write(user_line(NOTE_FROM + str(m.get("text") or "")[:500]))
+                                p.stdin.flush()
+                                acks.append(m.get("id"))
+                                finished.clear()  # the run is idle again only after Claude answers this note
+                            except (OSError, ValueError):  # Claude has just exited: tidbit hands the note out again
+                                lost.append(m.get("id"))
+                        if r.get("cancel"):
+                            stop = ("cancelled", "Stopped by you")
+                    except Fail as e:
+                        talk = e.code != 404  # an older tidbit, or no such project: stop asking. Any other answer: try again next round
+                    except Exception:
+                        pass
+                if finished.is_set() and not stop and not p.stdin.closed:
+                    try:
+                        p.stdin.close()  # Claude has answered and nobody wrote to it since: let it end (a note that could not be acknowledged does not hold it open)
+                    except OSError:
+                        pass
                 if now() - t0 > limit:
                     stop = ("needs_you", f"Claude was still working after {limit // 60} minutes and was stopped. Open the project to continue.")
-                elif now() - last >= 30:
+                elif now() - last >= 30 and not stop:
                     last = now()
                     try:
                         if not c.call("progress", {"job_id": jid, "pct": min(95, 5 + int(90 * (now() - t0) / limit)), "log": ""}).get("ok"):
@@ -1570,6 +1708,15 @@ def auto_run(folder, cfg, slug, d, c, jid, now=time.time, approved=()):
                     except subprocess.TimeoutExpired:
                         p.kill()
                     return stop
+            rd.join(5)
+            p.stdout.close()
+            if talk:  # the last lines, so the page ends on Claude's own closing words
+                with lk:
+                    batch = pending[:40]
+                try:
+                    say(batch, take=False)  # nothing can be delivered any more, so no note is handed out
+                except Exception:
+                    pass
         return ("done", "") if p.returncode == 0 else ("failed", "Claude stopped with an error. The log is in .tidbit/runs on this computer.")
     finally:
         lock.unlink(missing_ok=True)
@@ -1584,7 +1731,7 @@ def run_open_project(job, folder, cfg, c=None):
     if not (d and d.is_dir()):
         raise RuntimeError("That project is not in the tidbit folder on this computer. Send it to Claude again from tidbit.")
     extra = {}
-    if (cfg or {}).get("autostart_claude") and c is not None:
+    if (cfg or {}).get("autostart_claude") and c is not None and SERVER["seen"] and not SERVER["auto_pause"]:  # paused on the Jobs page, or tidbit has not said yet: the project waits for the user's own session
         track(c, folder, slug, "on_computer", "The project is in your tidbit folder")
         why = auto_gate(folder, cfg, d)
         if why is None:
@@ -1679,13 +1826,18 @@ class State:
     stop = False
 
 
+def beat(c, cfg, folder, st):
+    hc = heartbeat_claude(cfg)
+    (tdir(folder) / "alive.json").write_text(json.dumps({"t": time.time(), "claude": hc}))  # read by the plugin's status line
+    r = c.call("heartbeat", {"name": c.name, "os": platform.system(), "folder": str(folder), "caps": CAPS, "claude": hc, "auto": bool((load(folder, False) or {}).get("autostart_claude"))})
+    st.sync_server, st.upload_server, st.waiting = bool(r.get("sync")), bool(r.get("upload")), r.get("waiting", 0)
+    SERVER["show_session"], SERVER["auto_pause"], SERVER["seen"] = bool(r.get("show_session")), bool(r.get("auto_pause")), True
+
+
 def heartbeat_loop(c, cfg, folder, st):
     while not st.stop:
         try:
-            hc = heartbeat_claude(cfg)
-            (tdir(folder) / "alive.json").write_text(json.dumps({"t": time.time(), "claude": hc}))  # read by the plugin's status line
-            r = c.call("heartbeat", {"name": c.name, "os": platform.system(), "folder": str(folder), "caps": CAPS, "claude": hc})
-            st.sync_server, st.upload_server, st.waiting = bool(r.get("sync")), bool(r.get("upload")), r.get("waiting", 0)
+            beat(c, cfg, folder, st)
         except Exception:
             pass
         time.sleep(15)
@@ -1739,6 +1891,10 @@ def run(a):
     init_folder(folder)
     clean_jobs(folder)
     c, st = Client(cfg["server"], cfg["key"], cfg["name"]), State()
+    try:
+        beat(c, cfg, folder, st)  # first answer before the first claim, so a pause set on the Jobs page holds from the start
+    except Exception:
+        pass  # offline: a project that arrives before the first answer waits for the user's own session
     threading.Thread(target=heartbeat_loop, args=(c, cfg, folder, st), daemon=True).start()
     threading.Thread(target=sync_loop, args=(c, cfg, folder, st), daemon=True).start()
     threading.Thread(target=library_loop, args=(c, folder, st), daemon=True).start()
