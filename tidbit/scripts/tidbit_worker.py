@@ -1525,7 +1525,7 @@ def auto_gate(folder, cfg, d, now=time.time):
     return None
 
 
-def auto_run(folder, cfg, slug, d, c, jid, now=time.time):
+def auto_run(folder, cfg, slug, d, c, jid, now=time.time, approved=()):
     """One headless Claude run in the project folder, one at a time. Returns (state, note): done, failed, cancelled or needs_you."""
     box = tdir(folder)
     lock = box / "auto.lock"
@@ -1545,7 +1545,8 @@ def auto_run(folder, cfg, slug, d, c, jid, now=time.time):
         (box / "runs").mkdir(exist_ok=True)
         with open(box / "runs" / f"{slug}.log", "ab") as lg:  # stays on this computer
             p = subprocess.Popen(argv, cwd=d, stdin=subprocess.PIPE, stdout=lg, stderr=subprocess.STDOUT)
-            p.stdin.write(AUTO_TASK.encode())
+            ok = [x for x in approved if x in ("research", "film", "edit", "post")]  # the steps the user approved on the Autopilot board
+            p.stdin.write((AUTO_TASK + (f" The user approved these steps on their Autopilot board: {', '.join(ok)}. Carry on with the step after them." if ok else "")).encode())
             p.stdin.close()
             t0 = last = now()
             while p.poll() is None:
@@ -1587,7 +1588,7 @@ def run_open_project(job, folder, cfg, c=None):
         track(c, folder, slug, "on_computer", "The project is in your tidbit folder")
         why = auto_gate(folder, cfg, d)
         if why is None:
-            state, why = auto_run(folder, cfg, slug, d, c, job["id"])
+            state, why = auto_run(folder, cfg, slug, d, c, job["id"], approved=job["params"].get("approved") or ())
             if state == "done":
                 track(c, folder, slug, "done", "Claude finished")
                 return {"slug": slug, "state": "done", "auto": True}
